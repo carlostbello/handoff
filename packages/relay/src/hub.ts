@@ -269,6 +269,30 @@ export class Hub extends DurableObject<Env> {
   }
 
   /** Returns the R2 multipart upload id for a blob, recording a new one if needed. */
+  /**
+   * A job the host starts on its own, for a device it's paired with: an update
+   * from a conversation the device handed off earlier (e.g. the user replied to
+   * the agent in T3). It starts as running; the host uploads the result next.
+   */
+  createHostJob(deviceId: string, id: string): JobRecord {
+    if (!/^[0-9A-HJKMNP-TV-Z]{26}$/.test(id)) throw new HttpError(400, "job id must be a ULID")
+    if (!this.devices().some((d) => d.id === deviceId)) throw new HttpError(404, "unknown device")
+    const existing = this.row(id)
+    if (existing) {
+      if (existing.deviceId !== deviceId) throw new HttpError(409, "job id in use")
+      return this.public(existing)
+    }
+    const now = Date.now()
+    this.sql.exec(
+      "INSERT INTO jobs (id, device_id, status, created_at, updated_at) VALUES (?, ?, 'running', ?, ?)",
+      id,
+      deviceId,
+      now,
+      now,
+    )
+    return this.public(this.row(id)!)
+  }
+
   uploadIdFor(principal: Principal, id: string, kind: BlobKind): { uploadId: string | null; allowed: boolean } {
     const job = this.authorizedJob(principal, id)
     if (kind === "request") {

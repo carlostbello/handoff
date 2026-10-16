@@ -2,7 +2,7 @@
 // -> bundle agent commits -> encrypt -> upload. Each step is checkpointed in the
 // local state file so a daemon restart (or host reboot) resumes where it left off.
 
-import { mkdir, rm, writeFile, readFile } from "node:fs/promises"
+import { mkdir, rm, stat, writeFile, readFile } from "node:fs/promises"
 import { join } from "node:path"
 import {
   PROTOCOL_VERSION,
@@ -13,7 +13,11 @@ import {
   seal,
   sealContext,
   sealJson,
+  formatModelSpec,
+  sha256Hex,
+  ulid,
   unpackContainer,
+  utf8,
   type EventKind,
   type ModelSelection,
   type ErrorPayload,
@@ -37,6 +41,9 @@ export type T3Like = Pick<
   | "launch"
   | "wait"
   | "activeSubagents"
+  | "lastUserMessage"
+  | "send"
+  | "configure"
   | "finalRunStatus"
   | "thread"
   | "finalAssistantText"
@@ -46,7 +53,7 @@ export type T3Like = Pick<
   | "interrupt"
   | "close"
 >
-import { buildPrompt } from "./prompt.js"
+import { buildFollowUpPrompt, buildPrompt, type ContextFiles } from "./prompt.js"
 import { describeResolution, resolveModels } from "./models.js"
 
 type Phase = "claimed" | "launched" | "collecting" | "uploaded" | "failed" | "cancelled"
@@ -65,17 +72,59 @@ interface LocalJob {
   startedAt: number
   /** Request ids already forwarded to the device. */
   askedRequests?: string[]
+  /** The opencode session this job came from. */
+  sessionId?: string
+  /** Set when this job continued an existing thread: its latest run before the follow-up was sent. */
+  baselineRunId?: string | null
+}
+
+/**
+ * One opencode session's conversation with one T3 thread. Follow-up handoffs
+ * from that session continue the thread, and work done in the thread from T3
+ * itself is sent back to the session.
+ */
+interface Conversation {
+  deviceId: string
+  sessionId: string
+  repoKey: string
+  repoDir: string
+  projectId: string
+  threadId: string
+  threadTitle: string
+  branch: string
+  /** The newest commit of `branch` the device has received. */
+  deliveredHead: string
+  /** The thread's latest run when the device was last brought up to date. */
+  lastRunId: string | null
+  lastSummaryHash?: string
+  /** The device's newest job in this conversation (a handoff or an update). */
+  lastJobId: string
+  /** A handoff job currently working in the thread. */
+  activeJobId?: string
+  updatedAt: number
+}
+
+/** The host's folder and T3 project for one client repository. */
+interface RepoHome {
+  dir: string
+  name: string
 }
 
 interface State {
   eventCursor: number
   jobs: Record<string, LocalJob>
+  conversations: Record<string, Conversation>
+  repos: Record<string, RepoHome>
 }
+
+const EMPTY_STATE = (): State => ({ eventCursor: 0, jobs: {}, conversations: {}, repos: {} })
+/** Stop watching a conversation's thread after this long without activity. */
+const CONVERSATION_TTL_MS = 14 * 24 * 60 * 60 * 1000
 
 const log = (...args: unknown[]) => console.log(new Date().toISOString(), ...args)
 
 export class Runner {
-  private state: State = { eventCursor: 0, jobs: {} }
+  private state: State = EMPTY_STATE()
   private active = new Map<string, Promise<void>>()
   private relay: HostClient
   private t3: T3Like
@@ -100,7 +149,7 @@ export class Runner {
 
   /** One full pass (events, queue, and every job it starts). Used by tests and `status`. */
   async runOnce(): Promise<void> {
-    this.state = (await readJson<State>(STATE_PATH)) ?? this.state
+    this.state = { ...EMPTY_STATE(), ...(await readJson<State>(STATE_PATH)) }
     await this.pollEvents()
     for (;;) {
       const claimed = await this.pollQueue()
@@ -108,6 +157,7 @@ export class Runner {
       if (!claimed) break
       await this.pollEvents()
     }
+    await this.pollConversations()
   }
 
   private async save(): Promise<void> {
@@ -121,7 +171,7 @@ export class Runner {
   }
 
   async start(): Promise<void> {
-    this.state = (await readJson<State>(STATE_PATH)) ?? { eventCursor: 0, jobs: {} }
+    this.state = { ...EMPTY_STATE(), ...(await readJson<State>(STATE_PATH)) }
     await this.relay.setHostKey(this.config.keys.publicKey)
     log(`handoff-daemon running; relay ${this.config.relayUrl}`)
     this.openSocket()
@@ -135,6 +185,7 @@ export class Runner {
       try {
         await this.pollEvents()
         await this.pollQueue()
+        await this.pollConversations()
       } catch (err) {
         log("poll error:", (err as Error).message)
       }
@@ -342,12 +393,19 @@ export class Runner {
 
     const bundlePath = join(dir, "request.bundle")
     await writeFile(bundlePath, bundle, { mode: 0o600 })
-    const contextPath = join(dir, "context.md")
-    await writeFile(contextPath, manifest.session.transcript, { mode: 0o600 })
+    // Context the agent reads on demand, instead of a giant first message.
+    const files: ContextFiles = { transcript: join(dir, "transcript.md") }
+    await writeFile(files.transcript, manifest.session.transcript, { mode: 0o600 })
+    if (manifest.brief) {
+      files.brief = join(dir, "brief.md")
+      await writeFile(files.brief, `# ${manifest.brief.title}\n\n${manifest.brief.task}\n`, { mode: 0o600 })
+    }
     await writeFile(join(dir, "manifest.json"), JSON.stringify({ ...manifest, session: { ...manifest.session, transcript: "(see context.md)" } }, null, 2))
 
-    // Mirror repository (one per device repo id); registered once as a T3 project.
-    const repoDir = join(this.config.reposDir, `${slugify(manifest.repo.name, 30)}-${manifest.repo.id.slice(0, 8)}`)
+    // One folder per client repository, registered once as a T3 project.
+    const repoKey = `${job.deviceId}:${manifest.repo.id}`
+    const home = await this.repoHome(repoKey, manifest)
+    const repoDir = home.dir
     await mkdir(repoDir, { recursive: true })
     if (!(await gitOk(["rev-parse", "--git-dir"], { cwd: repoDir }))) {
       await git(["init", "--initial-branch=handoff-mirror"], { cwd: repoDir })
@@ -371,27 +429,38 @@ export class Runner {
     const dirty = (await git(["status", "--porcelain"], { cwd: repoDir })).trim()
     if (!dirty) await git(["checkout", "-q", "-B", "handoff-mirror", snapshot], { cwd: repoDir }).catch(() => {})
 
-    const project = await this.t3.ensureProject(repoDir, manifest.repo.name)
-    const branch = `${this.config.branchPrefix}${slugify(manifest.instructions || manifest.session.title || "task", 32)}-${job.id.slice(-6).toLowerCase()}`
-    const threadTitle = `Handoff: ${(manifest.instructions || manifest.session.title || manifest.repo.name).split("\n")[0]!.slice(0, 60)} [${job.id.slice(-6)}]`
-    await this.update(job, { repoDir, baseBranch, branch, snapshot, projectId: project.id, threadTitle })
+    const project = await this.t3.ensureProject(repoDir, home.name)
+    // Model choice: --model, else a model named in the request, else the host default; all within the allowed lists.
+    const models = resolveModels(this.config, manifest.instructions, manifest.options.model)
+
+    // A follow-up from the same opencode session continues that session's thread.
+    const conversationKey = `${job.deviceId}:${manifest.session.id}`
+    const conversation = this.state.conversations[conversationKey]
+    if (conversation && conversation.repoKey === repoKey && (await this.canContinue(conversation, snapshot))) {
+      await this.update(job, { repoDir, baseBranch, branch: conversation.branch, snapshot, projectId: project.id, threadTitle: conversation.threadTitle, sessionId: manifest.session.id })
+      await this.continueConversation(job, conversation, manifest, snapshot, files, models)
+      return
+    }
+
+    const title = manifest.brief?.title || manifest.instructions || manifest.session.title || manifest.repo.name
+    const branch = `${this.config.branchPrefix}${slugify(manifest.brief?.slug || manifest.instructions || manifest.session.title || "task", 32)}-${job.id.slice(-6).toLowerCase()}`
+    const threadTitle = `Handoff: ${title.split("\n")[0]!.slice(0, 60)} [${job.id.slice(-6)}]`
+    await this.update(job, { repoDir, baseBranch, branch, snapshot, projectId: project.id, threadTitle, sessionId: manifest.session.id })
 
     // A crash between launch and the checkpoint below must not create a duplicate thread.
     const existing = await this.t3.findThreadByTitle(project.id, `[${job.id.slice(-6)}]`)
     let threadId = existing?.threadId
     if (!threadId) {
-      // Model choice: --model, else a model named in the request, else the host default; all within the allowed lists.
-      const models = resolveModels(this.config, manifest.instructions, manifest.options.model)
       await this.notify(job, describeResolution(models), true)
       const model = models.lead
       const message = buildPrompt({
         manifest,
         branch,
         snapshot,
-        contextPath,
+        files,
         models,
         instructions: this.config.instructions,
-        transcriptChars: this.config.promptTranscriptChars,
+        excerptChars: this.config.promptTranscriptChars,
       })
       threadId = await this.t3.launch({
         projectId: project.id,
@@ -405,8 +474,136 @@ export class Runner {
       })
     }
     await this.update(job, { threadId, phase: "launched" })
+    this.state.conversations[conversationKey] = {
+      deviceId: job.deviceId,
+      sessionId: manifest.session.id,
+      repoKey,
+      repoDir,
+      projectId: project.id,
+      threadId,
+      threadTitle,
+      branch,
+      deliveredHead: snapshot,
+      lastRunId: null,
+      lastJobId: job.id,
+      activeJobId: job.id,
+      updatedAt: Date.now(),
+    }
+    await this.save()
     await this.relay.setStatus(job.id, "running")
     await this.notify(job, `T3 thread started on branch ${branch}`)
+  }
+
+  /**
+   * The folder and T3 project name for a client repository: `<reposDir>/<name>`,
+   * named after the project name the client's model suggested (or the repository).
+   */
+  private async repoHome(repoKey: string, manifest: RequestManifest): Promise<RepoHome> {
+    const known = this.state.repos[repoKey]
+    if (known) return known
+    const name = manifest.brief?.projectName?.trim() || manifest.repo.name
+    // Folders from before named project folders: keep using them.
+    const legacyName = `${slugify(manifest.repo.name, 30)}-${manifest.repo.id.slice(0, 8)}`
+    for (const legacy of [join(this.config.reposDir, legacyName), join(this.config.reposDir, "repos", legacyName)]) {
+      if (await gitOk(["rev-parse", "--git-dir"], { cwd: legacy })) return this.saveRepoHome(repoKey, { dir: legacy, name })
+    }
+    const base = slugify(name, 40) || "project"
+    const taken = new Set(Object.values(this.state.repos).map((r) => r.dir))
+    for (let n = 1; ; n++) {
+      const dir = join(this.config.reposDir, n === 1 ? base : `${base}-${n}`)
+      if (!taken.has(dir) && !(await pathExists(dir))) return this.saveRepoHome(repoKey, { dir, name })
+    }
+  }
+
+  private async saveRepoHome(repoKey: string, home: RepoHome): Promise<RepoHome> {
+    this.state.repos[repoKey] = home
+    await this.save()
+    return home
+  }
+
+  /** The thread can take a follow-up if it still exists and the client built on what it last received. */
+  private async canContinue(conversation: Conversation, snapshot: string): Promise<boolean> {
+    const thread = await this.t3.thread(conversation.threadId).catch(() => null)
+    if (!thread?.worktreePath || !(await pathExists(thread.worktreePath))) return false
+    const tip = await revParse(conversation.repoDir, `refs/heads/${conversation.branch}`)
+    if (!tip) return false
+    return gitOk(["merge-base", "--is-ancestor", tip, snapshot], { cwd: conversation.repoDir })
+  }
+
+  /** Send a follow-up into an existing thread, after bringing its branch up to the client's snapshot. */
+  private async continueConversation(
+    job: LocalJob,
+    conversation: Conversation,
+    manifest: RequestManifest,
+    snapshot: string,
+    files: ContextFiles,
+    models: ReturnType<typeof resolveModels>,
+  ): Promise<void> {
+    conversation.activeJobId = job.id
+    conversation.updatedAt = Date.now()
+    await this.save()
+    await this.waitUntilIdle(job, conversation)
+    const thread = await this.t3.thread(conversation.threadId)
+    const worktree = thread.worktreePath!
+    await this.commitLeftovers(worktree)
+    await git(["merge", "--ff-only", "-q", snapshot], { cwd: worktree })
+    const lead = await this.leadForFollowUp(conversation, thread, models)
+    await this.notify(job, `${lead} Continuing T3 thread "${conversation.threadTitle}".`, true)
+    const message = buildFollowUpPrompt({ manifest, branch: conversation.branch, snapshot, files, models })
+    await this.update(job, { threadId: conversation.threadId, baselineRunId: thread.latestRunId })
+    await this.t3.send(conversation.threadId, message, `handoff-${job.id}`)
+    await this.update(job, { phase: "launched" })
+    await this.relay.setStatus(job.id, "running")
+  }
+
+  /**
+   * A follow-up keeps the thread's model unless the user chose one (--model or by
+   * name). Then the thread switches to it, if T3 allows that mid-thread.
+   */
+  private async leadForFollowUp(
+    conversation: Conversation,
+    thread: { providerInstanceId?: string | null; model?: string | null },
+    models: ReturnType<typeof resolveModels>,
+  ): Promise<string> {
+    const current = thread.providerInstanceId && thread.model ? `${thread.providerInstanceId}/${thread.model}` : "the thread's model"
+    const steps = models.mentioned.length ? ` Models named for steps: ${models.mentioned.map((m) => `${m.mentionedAs[0]} → ${formatModelSpec(m.selection)}`).join(", ")}.` : ""
+    const chosen = models.leadSource !== "default" ? models.lead : null
+    if (!chosen || (chosen.instanceId === thread.providerInstanceId && chosen.model === thread.model)) {
+      return `Lead model: ${current} (this thread's).${steps}`
+    }
+    try {
+      await this.t3.configure(conversation.threadId, toT3Model(chosen))
+      return `Lead model: ${formatModelSpec(chosen)} (switched from ${current}).${steps}`
+    } catch (err) {
+      log(`thread ${conversation.threadId}: couldn't switch model: ${(err as Error).message}`)
+      // Still reachable as a subagent.
+      models.subagents.unshift({ selection: chosen, mentionedAs: [] })
+      return `Lead model: ${current}; T3 couldn't switch this thread to ${formatModelSpec(chosen)}, so it's available to the agent as a subagent instead.${steps}`
+    }
+  }
+
+  /** Wait for the thread (and its subagents) to finish whatever it is doing before changing its branch. */
+  private async waitUntilIdle(job: LocalJob, conversation: Conversation): Promise<void> {
+    const deadline = job.startedAt + this.config.jobTimeoutMinutes * 60 * 1000
+    for (let told = false; ; ) {
+      const thread = await this.t3.thread(conversation.threadId)
+      const busy = ACTIVE_STATUSES.includes(thread.status) || (await this.t3.activeSubagents(conversation.projectId, conversation.threadId)).length > 0
+      if (!busy) return
+      if (Date.now() > deadline) throw new Error("the conversation's T3 thread stayed busy until the job timed out")
+      if (!told) await this.notify(job, "The T3 thread is still working; the follow-up will start when it finishes")
+      told = true
+      await new Promise((r) => setTimeout(r, Math.min(5000, this.settleMs)))
+    }
+  }
+
+  private async commitLeftovers(worktree: string, message = "handoff: uncommitted changes left by the agent"): Promise<void> {
+    const status = await git(["status", "--porcelain"], { cwd: worktree }).catch(() => "")
+    if (!status.trim()) return
+    await git(["add", "-A"], { cwd: worktree })
+    await git(["commit", "-q", "-m", message], {
+      cwd: worktree,
+      env: { GIT_AUTHOR_NAME: "handoff", GIT_AUTHOR_EMAIL: "handoff@localhost", GIT_COMMITTER_NAME: "handoff", GIT_COMMITTER_EMAIL: "handoff@localhost" },
+    })
   }
 
   private async waitForThread(job: LocalJob): Promise<void> {
@@ -419,6 +616,12 @@ export class Runner {
       if (this.stopping) throw new Error("daemon stopping")
       if (this.cancels.has(job.id)) return
       const res = await this.t3.wait(threadId, 60_000)
+      // A follow-up was sent to a thread whose previous run already finished: wait for the new run.
+      const followUpPending = job.baselineRunId !== undefined && res.runId === job.baselineRunId
+      if (followUpPending && Date.now() <= deadline) {
+        await new Promise((r) => setTimeout(r, Math.min(3000, this.settleMs)))
+        continue
+      }
       if (res.timedOut || ACTIVE_STATUSES.includes(res.status)) {
         idleSince = null
       } else {
@@ -485,16 +688,7 @@ export class Runner {
 
     // Commit anything the agent left uncommitted in its worktree.
     const worktree = thread.worktreePath ?? (await findWorktree(repoDir, branch))
-    if (worktree) {
-      const status = await git(["status", "--porcelain"], { cwd: worktree }).catch(() => "")
-      if (status.trim()) {
-        await git(["add", "-A"], { cwd: worktree })
-        await git(["commit", "-q", "-m", "handoff: uncommitted changes left by the agent"], {
-          cwd: worktree,
-          env: { GIT_AUTHOR_NAME: "handoff", GIT_AUTHOR_EMAIL: "handoff@localhost", GIT_COMMITTER_NAME: "handoff", GIT_COMMITTER_EMAIL: "handoff@localhost" },
-        })
-      }
-    }
+    if (worktree) await this.commitLeftovers(worktree)
 
     const head = await revParse(repoDir, `refs/heads/${branch}`)
     const commits = head ? await commitList(repoDir, `${snapshot}..${head}`) : []
@@ -510,6 +704,8 @@ export class Runner {
     const manifest: ResultManifest = {
       v: PROTOCOL_VERSION,
       jobId: job.id,
+      origin: "handoff",
+      sessionId: job.sessionId ?? "",
       outcome: (await this.t3.finalRunStatus(job.threadId!)) === "completed" || commits.length > 0 ? "succeeded" : "failed",
       branch,
       head: commits.length ? head : null,
@@ -525,8 +721,131 @@ export class Runner {
     await this.relay.uploadResult(job.id, sealed)
     await this.update(job, { phase: "uploaded" })
     log(`job ${job.id}: result uploaded (${commits.length} commits, ${sealed.length} bytes)`)
+    const conversation = Object.values(this.state.conversations).find((c) => c.activeJobId === job.id)
+    if (conversation) {
+      // The device is now up to date with this thread; later runs started from T3 are sent as updates.
+      Object.assign(conversation, {
+        deliveredHead: commits.length && head ? head : snapshot,
+        lastRunId: (await this.t3.thread(job.threadId!)).latestRunId,
+        lastSummaryHash: await sha256Hex(utf8(summary)),
+        lastJobId: job.id,
+        activeJobId: undefined,
+        updatedAt: Date.now(),
+      })
+      await this.save()
+    }
     await rm(join(this.jobDir(job.id), "request.bundle"), { force: true })
   }
+
+  // ---------- updates from T3 ----------
+
+  /**
+   * Work done in a conversation's thread from T3 itself (the user replied to the
+   * agent in T3 Code or T3 Connect) goes back to the client's opencode session
+   * once the round finishes.
+   */
+  async pollConversations(): Promise<void> {
+    const paired = await loadDevices()
+    for (const [key, conversation] of Object.entries(this.state.conversations)) {
+      try {
+        if (!paired[conversation.deviceId]) {
+          // The client was revoked: nothing to send it any more.
+          delete this.state.conversations[key]
+          await this.save()
+          continue
+        }
+        const active = conversation.activeJobId ? this.state.jobs[conversation.activeJobId] : undefined
+        if (active && ["claimed", "launched", "collecting"].includes(active.phase)) continue
+        if (Date.now() - conversation.updatedAt > CONVERSATION_TTL_MS) {
+          delete this.state.conversations[key]
+          await this.save()
+          continue
+        }
+        const thread = await this.t3.thread(conversation.threadId).catch(() => null)
+        if (!thread?.latestRunId || thread.latestRunId === conversation.lastRunId) continue
+        if (ACTIVE_STATUSES.includes(thread.status)) continue
+        if ((await this.t3.activeSubagents(conversation.projectId, conversation.threadId)).length) continue
+        // Same settling rule as handoff jobs: a subagent's report can start another run shortly after.
+        const seen = this.settling.get(key)
+        if (!seen || seen.runId !== thread.latestRunId) {
+          this.settling.set(key, { runId: thread.latestRunId, since: Date.now() })
+          continue
+        }
+        if (Date.now() - seen.since < this.settleMs) continue
+        this.settling.delete(key)
+        await this.pushUpdate(conversation, thread)
+      } catch (err) {
+        log(`conversation ${conversation.threadId}: ${(err as Error).message}`)
+      }
+    }
+  }
+
+  private settling = new Map<string, { runId: string; since: number }>()
+
+  private async pushUpdate(conversation: Conversation, thread: { worktreePath: string | null; latestRunId: string | null }): Promise<void> {
+    const { repoDir, branch } = conversation
+    if (thread.worktreePath) await this.commitLeftovers(thread.worktreePath, "handoff: uncommitted changes from T3")
+    const head = (await revParse(repoDir, `refs/heads/${branch}`)) ?? conversation.deliveredHead
+    const commits = await commitList(repoDir, `${conversation.deliveredHead}..${head}`)
+    const summary = (await this.t3.finalAssistantText(conversation.threadId)) || "(No message from the agent.)"
+    const summaryHash = await sha256Hex(utf8(summary))
+    if (!commits.length && summaryHash === conversation.lastSummaryHash) {
+      // e.g. a queued wake-up that T3 cancelled before it started: nothing new to send.
+      conversation.lastRunId = thread.latestRunId
+      await this.save()
+      return
+    }
+
+    // What the user asked in T3, unless the newest message is one of handoff's own prompts.
+    const asked = await this.t3.lastUserMessage(conversation.threadId)
+    const request = asked && !/^(You are continuing work handed off|Follow-up from the user's opencode session)/.test(asked) ? asked : undefined
+    const id = ulid()
+    await this.relay.createJob(id, conversation.deviceId)
+    const dir = this.jobDir(id)
+    await mkdir(dir, { recursive: true, mode: 0o700 })
+    let bundle: Uint8Array = new Uint8Array()
+    if (commits.length) {
+      const path = join(dir, "result.bundle")
+      await git(["bundle", "create", path, `refs/heads/${branch}`, `^${conversation.deliveredHead}`], { cwd: repoDir })
+      bundle = await readFile(path)
+    }
+    const manifest: ResultManifest = {
+      v: PROTOCOL_VERSION,
+      jobId: id,
+      origin: "host",
+      sessionId: conversation.sessionId,
+      parentJobId: conversation.lastJobId,
+      ...(request ? { request } : {}),
+      outcome: "succeeded",
+      branch,
+      head: commits.length ? head : null,
+      snapshot: conversation.deliveredHead,
+      commits,
+      diffstat: commits.length ? await git(["diff", "--stat", conversation.deliveredHead, head], { cwd: repoDir }) : "",
+      summary,
+      t3: { projectId: conversation.projectId, threadId: conversation.threadId, threadTitle: conversation.threadTitle },
+      knownCommit: head,
+    }
+    const key = await this.deviceKey(conversation.deviceId)
+    await this.relay.uploadResult(id, await seal(packContainer(manifest, bundle), key, this.config.keys, sealContext.result(id)))
+    Object.assign(conversation, {
+      deliveredHead: head,
+      lastRunId: thread.latestRunId,
+      lastSummaryHash: summaryHash,
+      lastJobId: id,
+      updatedAt: Date.now(),
+    })
+    await this.save()
+    await rm(dir, { recursive: true, force: true })
+    log(`conversation ${conversation.threadId}: sent update ${id} (${commits.length} commits)`)
+  }
+}
+
+async function pathExists(path: string): Promise<boolean> {
+  return stat(path).then(
+    () => true,
+    () => false,
+  )
 }
 
 async function findWorktree(repoDir: string, branch: string): Promise<string | null> {

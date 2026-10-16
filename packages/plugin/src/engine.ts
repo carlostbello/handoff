@@ -23,6 +23,7 @@ import {
   ulid,
   unpackContainer,
   type ErrorPayload,
+  type HandoffBrief,
   type JobRecord,
   type QuestionPayload,
   type RelayEvent,
@@ -32,6 +33,7 @@ import {
   type StatusPayload,
 } from "@handoff/shared"
 import { condenseTranscript } from "@handoff/shared/transcript"
+import { briefPrompt, parseBrief } from "./brief.js"
 import { adoptSnapshot, applyResult, createBundle, deleteRef, repoTop, takeSnapshot, type ApplyOutcome } from "./repo.js"
 import {
   DEFAULT_SETTINGS,
@@ -55,6 +57,8 @@ export interface Opencode {
   sessionDirectory(sessionID: string): Promise<string>
   sessionTitle(sessionID: string): Promise<string | null>
   exportSession(sessionID: string): Promise<unknown>
+  /** Ask the session's model for text, from the session's context, without adding a turn. */
+  generate(sessionID: string, prompt: string): Promise<string>
   /** Add a message to the session; with resume the agent takes a turn. Returns false if the session is gone. */
   post(sessionID: string, text: string, opts: { resume: boolean; description: string }): Promise<boolean>
   createSession(directory: string, title: string): Promise<string>
@@ -64,6 +68,13 @@ export interface Opencode {
 /** Inbox description marking ephemeral notices (see tui.ts). */
 export const NOTICE = "handoff-notice"
 const ACTIVE_POLL_MS = 15_000
+/** After a result, the user may keep talking to the agent in T3; check for updates this often. */
+const CONVERSATION_POLL_MS = 60_000
+const CONVERSATION_WINDOW_MS = 24 * 60 * 60 * 1000
+const IDLE_POLL_MS = 5 * 60_000
+/** Writing the brief uses the session's model; don't hold the handoff up longer than this per attempt. */
+const BRIEF_TIMEOUT_MS = 90_000
+const BRIEF_ATTEMPTS = 2
 const LEASE_MS = 60_000
 
 const short = (id: string) => id.slice(-6).toLowerCase()
@@ -106,6 +117,7 @@ export class Engine {
           return void (await say(HELP))
         default: {
           const { instructions, ...options } = parseHandoffArgs(text)
+          if ((await loadSettings()).brief) await say("Writing the handoff brief…")
           const job = await this.submit(sessionID, instructions, options)
           // A notice, not a queued message: queued messages reach the agent one turn each, so a stale
           // "handed off" note would cost a turn ahead of the result. The result message says it all.
@@ -185,15 +197,19 @@ export class Engine {
       } catch (err) {
         this.opencode.log(`handoff: session export failed: ${(err as Error).message}`)
       }
+      const repoName = top.split("/").pop() || "repo"
+      const brief = retryOf?.brief ?? (settings.brief && !retryOf ? await this.writeBrief(sessionID, instructions, repoName) : undefined)
+      if (brief) await updateJob(id, { brief })
       const manifest: RequestManifest = {
         v: PROTOCOL_VERSION,
         jobId: id,
         deviceId: config.deviceId,
         createdAt: job.createdAt,
         instructions,
+        ...(brief ? { brief } : {}),
         repo: {
           id: repo.id,
-          name: top.split("/").pop() || "repo",
+          name: repoName,
           branch: snap.branch,
           head: snap.head,
           snapshot: snap.snapshot,
@@ -217,6 +233,23 @@ export class Engine {
     return (await loadState()).jobs[id]!
   }
 
+  /** The session's model writes the brief; if it can't, the user's words go as they are. */
+  private async writeBrief(sessionID: string, instructions: string, repoName: string): Promise<HandoffBrief | undefined> {
+    // Models occasionally return nothing or malformed JSON; one retry fixes most of those.
+    for (let attempt = 1; attempt <= BRIEF_ATTEMPTS; attempt++) {
+      try {
+        const text = await withTimeout(this.opencode.generate(sessionID, briefPrompt(instructions, repoName)), BRIEF_TIMEOUT_MS)
+        const brief = parseBrief(text)
+        if (brief) return brief
+        this.opencode.log(`handoff: the model's brief wasn't usable (attempt ${attempt})`)
+      } catch (err) {
+        this.opencode.log(`handoff: couldn't write a brief (attempt ${attempt}): ${(err as Error).message}`)
+      }
+    }
+    this.opencode.log("handoff: sending the request as typed")
+    return undefined
+  }
+
   /** `/handoff config [key [value|reset]]` */
   async configure(args: string[]): Promise<string> {
     const settings = await loadSettings()
@@ -238,9 +271,9 @@ export class Engine {
     } else if (k === "apply") {
       if (value !== "auto" && value !== "branch") throw new Error("`apply` is `auto` or `branch`")
       next.apply = value
-    } else if (k === "resume") {
-      if (value !== "true" && value !== "false") throw new Error("`resume` is `true` or `false`")
-      next.resume = value === "true"
+    } else if (k === "resume" || k === "brief") {
+      if (value !== "true" && value !== "false") throw new Error(`\`${k}\` is \`true\` or \`false\``)
+      next[k] = value === "true"
     } else {
       const n = Number(value)
       if (!Number.isInteger(n) || n < 0) throw new Error("`transcriptChars` is a whole number")
@@ -324,8 +357,11 @@ export class Engine {
     let next = ACTIVE_POLL_MS
     try {
       const active = await this.pollOnce()
-      // Nothing in flight: check rarely (a submit kicks the loop immediately).
-      if (!active) next = 5 * 60_000
+      if (!active) {
+        // Nothing in flight (a submit kicks the loop immediately). Updates from T3 can still arrive.
+        const recent = Object.values((await loadState()).jobs).some((j) => j.phase === "applied" && Date.now() - j.createdAt < CONVERSATION_WINDOW_MS)
+        next = recent ? CONVERSATION_POLL_MS : IDLE_POLL_MS
+      }
     } catch (err) {
       this.opencode.log(`handoff: poll failed: ${(err as Error).message}`)
       next = 60_000
@@ -342,8 +378,8 @@ export class Engine {
       if (!config) return false
       const state = await loadState()
       const inFlight = Object.values(state.jobs).filter((j) => ["uploading", "submitted", "applying"].includes(j.phase))
-      if (!inFlight.length) return false
-      if (!(await acquireLease(this.owner, LEASE_MS))) return true
+      // Events are checked even with nothing in flight: the host may send an update from T3.
+      if (!(await acquireLease(this.owner, LEASE_MS))) return inFlight.length > 0
 
       const { relay } = await this.client()
       // Resume uploads interrupted by a shutdown.
@@ -390,8 +426,13 @@ export class Engine {
   }
 
   private async handleEvent(config: DeviceConfig, relay: DeviceClient, ev: RelayEvent): Promise<void> {
+    if (ev.from !== "host") return
     const job = (await loadState()).jobs[ev.jobId]
-    if (!job || ev.from !== "host") return
+    if (!job) {
+      // A result for a job this machine didn't start: an update from a conversation's T3 thread.
+      if (ev.kind === "result") await this.receiveUpdate(config, relay, ev.jobId)
+      return
+    }
     // Every host event must be sealed by the host key pinned at pairing.
     const read = <T>() => openJson<T>(ev.payload, config.keys, config.hostPublicKey, sealContext.event(ev.kind, ev.jobId))
     switch (ev.kind) {
@@ -480,6 +521,40 @@ export class Engine {
     await relay.ack(jobId).catch((err) => this.opencode.log(`handoff: ack failed: ${(err as Error).message}`))
   }
 
+  /**
+   * The conversation continued in T3 (the user replied to the agent there) and the
+   * host sent the result. Apply it like a handoff result, in the session it belongs to.
+   */
+  private async receiveUpdate(config: DeviceConfig, relay: DeviceClient, jobId: string): Promise<void> {
+    const plain = await open(await relay.downloadResult(jobId), config.keys, config.hostPublicKey, sealContext.result(jobId))
+    const { header: result } = unpackContainer<ResultManifest>(plain)
+    if (result.jobId !== jobId || result.origin !== "host") throw new Error(`unexpected result for unknown job ${jobId}`)
+    const jobs = Object.values((await loadState()).jobs)
+    const parent =
+      (result.parentJobId ? jobs.find((j) => j.id === result.parentJobId) : undefined) ??
+      jobs.filter((j) => j.sessionID === result.sessionId).sort((a, b) => b.createdAt - a.createdAt)[0]
+    if (!parent) throw new Error(`update ${jobId} is for a session this machine doesn't know`)
+    const job: DeviceJob = {
+      id: jobId,
+      phase: "submitted",
+      origin: "host",
+      sessionID: parent.sessionID,
+      directory: parent.directory,
+      repoTop: parent.repoTop,
+      repoId: parent.repoId,
+      // Your branch fast-forwards only if it is still exactly where the last result left it.
+      branch: parent.branch,
+      head: result.snapshot,
+      snapshot: result.snapshot,
+      instructions: "",
+      ...(parent.apply ? { apply: parent.apply } : {}),
+      createdAt: Date.now(),
+      lastStatus: "update from T3",
+    }
+    await mutateState((s) => void (s.jobs[jobId] ??= job))
+    await this.deliver(config, relay, jobId)
+  }
+
   private async postToSession(job: DeviceJob, text: string, resume: boolean): Promise<void> {
     const ok = await this.opencode.post(job.sessionID, text, { resume, description: `handoff ${short(job.id)}` }).catch(() => false)
     if (ok) return
@@ -498,6 +573,7 @@ const HELP = `**/handoff**: send this session's work to the host, where T3 Code 
 - Name models in plain words: \`/handoff continue with opus, have fable and astra subagents review the plan, then execute with 6.1 sol\`. The first model named outside a subagent phrase leads; the others are used for the steps you name them for. The host only accepts models it allows (\`handoff-daemon models\` there).
 - \`/handoff --model <name|provider/model> <instructions>\`: set the lead model explicitly (e.g. \`opus\` or \`claudeAgent/claude-opus-5-5:effort=high\`)
 - \`/handoff --branch ...\`: keep the result on its own branch instead of fast-forwarding yours
+- Follow up by running \`/handoff <message>\` again in the same session: it continues the same T3 thread. Replies you give the agent directly in T3 come back here too.
 - \`/handoff config [key [value|reset]]\`: show or change defaults (model, apply, resume, transcriptChars)
 - \`/handoff status\`: recent handoffs
 - \`/handoff reply <id> <answer>\`: answer a question from the host agent
@@ -541,6 +617,7 @@ const CLIENT_SETTING_HELP: Record<keyof ClientSettings, string> = {
   apply: "`auto` fast-forwards your branch when it hasn't moved; `branch` always leaves results on their own branch.",
   resume: "`true` lets the local agent respond when a result arrives; `false` just adds the result to the session.",
   transcriptChars: "Most characters of session transcript sent with a handoff.",
+  brief: "`true` has this session's model write a task brief for the host agent; `false` sends your request as typed.",
 }
 
 function formatSetting(settings: ClientSettings, key: keyof ClientSettings): string {
@@ -591,7 +668,10 @@ function resultMessage(job: DeviceJob, result: ResultManifest, outcome: ApplyOut
   let applied: string
   switch (outcome.kind) {
     case "fast-forwarded":
-      applied = `Your branch \`${outcome.branch}\` was fast-forwarded to the host's commits (also saved as \`${result.branch}\`). Your uncommitted work from before the handoff is now the first commit ("WIP: uncommitted changes at handoff").`
+      applied =
+        result.origin === "host"
+          ? `Your branch \`${outcome.branch}\` was fast-forwarded to the new commits (also saved as \`${result.branch}\`).`
+          : `Your branch \`${outcome.branch}\` was fast-forwarded to the host's commits (also saved as \`${result.branch}\`). Your uncommitted work from before the handoff is now the first commit ("WIP: uncommitted changes at handoff").`
       break
     case "branch-only":
       applied = `The commits are on local branch \`${result.branch}\`. I did not touch your checkout because ${outcome.reason}. Integrate with \`git merge ${result.branch}\` (or cherry-pick) when ready.`
@@ -599,9 +679,14 @@ function resultMessage(job: DeviceJob, result: ResultManifest, outcome: ApplyOut
     case "no-changes":
       applied = "The host made no code changes."
   }
+  const update = result.origin === "host"
   return [
-    `## Handoff \`${short(job.id)}\` ${result.outcome === "succeeded" ? "finished" : "ended without success"}`,
-    `You handed this off from this session${job.instructions ? ` with the instructions: "${job.instructions.split("\n")[0]!.slice(0, 300)}"` : " to continue the work in progress"}. It ran on the host in T3 thread "${result.t3.threadTitle}".`,
+    update
+      ? `## Update from T3 (\`${short(job.id)}\`)`
+      : `## Handoff \`${short(job.id)}\` ${result.outcome === "succeeded" ? "finished" : "ended without success"}`,
+    update
+      ? `The conversation from this session continued on the host in T3 thread "${result.t3.threadTitle}".${result.request ? ` The message sent to the agent in T3:\n\n> ${result.request.replace(/\n/g, "\n> ")}\n\n` : " "}Reply here with \`/handoff <message>\` to continue it from opencode.`
+      : `You handed this off from this session${job.instructions ? ` with the instructions: "${job.instructions.split("\n")[0]!.slice(0, 300)}"` : " to continue the work in progress"}. It ran on the host in T3 thread "${result.t3.threadTitle}". Follow up with \`/handoff <message>\` here, or directly in that thread in T3.`,
     applied,
     commits ? `### Commits\n${commits}` : "",
     result.diffstat ? `### Diffstat\n\`\`\`\n${result.diffstat}\n\`\`\`` : "",
@@ -610,4 +695,14 @@ function resultMessage(job: DeviceJob, result: ResultManifest, outcome: ApplyOut
   ]
     .filter(Boolean)
     .join("\n\n")
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`timed out after ${Math.round(ms / 1000)}s`)), ms)
+    promise.then(
+      (v) => (clearTimeout(timer), resolve(v)),
+      (e) => (clearTimeout(timer), reject(e)),
+    )
+  })
 }

@@ -35,12 +35,14 @@ How it behaves:
 1. **Client:** `/handoff add retry logic to the uploader`
    - The plugin snapshots your working tree into a commit, using a throwaway index. Your files, index and stash are untouched.
    - It bundles the snapshot with git. After the first handoff, bundles are incremental.
-   - It takes the session's current model context as the transcript.
+   - The session's own model writes a brief for the host agent: goal, what's been done, remaining work, constraints, how to tell it's done. It also picks a title, a branch name, a project name, the files to read first, and how much of the conversation to pass on: all of it, for reference only, or none if you asked for a fresh start. Your words go along unchanged. Turn this off with `/handoff config brief false`.
+   - It condenses the session into a transcript: the conversation, with tool calls reduced to one-liners.
    - It encrypts everything to the host's key and uploads it.
 2. **Relay:** stores ciphertext only. It queues the job and notifies the daemon over a WebSocket.
-3. **Host:** the daemon claims the job and decrypts it. It fetches the bundle into a per-repository mirror, registered once as a T3 project, and starts a T3 thread:
+3. **Host:** the daemon claims the job and decrypts it. It fetches the bundle into the repository's project folder, `~/handoff/<project name>`. The folder is created on the first handoff, registered as a T3 project, and reused after that. Then it starts a T3 thread:
    - The thread runs in a new worktree on branch `handoff/<task>-<id>`.
    - It uses the model you chose (see [Choosing models](#choosing-models)).
+   - Its first message is kept short: the brief, the workspace rules, and pointers to `brief.md` and `transcript.md`, which the agent reads when it needs them.
 4. **When the thread finishes:**
    - Anything left uncommitted is committed.
    - The daemon bundles the agent's commits and final message, encrypts them to the client's key, and uploads them.
@@ -50,7 +52,16 @@ How it behaves:
 
    It then posts the result (commits, diffstat, the agent's summary) into the original session, and the local agent takes a turn on it.
 
-If the agent asks a question, it shows up in your session. Answer with `/handoff reply <id> <answer>`. You can also watch or steer any handoff live in T3 Code: it's an ordinary thread titled `Handoff: … [ID]`.
+If the agent asks a question, it shows up in your session. Answer with `/handoff reply <id> <answer>`.
+
+### Continuing the conversation
+
+Each opencode session gets one T3 thread, and you can keep talking to it from either side:
+
+- **From opencode:** run `/handoff <message>` again in the same session. The host brings the thread's branch up to your latest snapshot and sends your message into the same thread. Naming a model, or using `--model`, switches the thread to that model where T3 allows it.
+- **From T3:** reply to the agent in T3 Code or T3 Connect. When that round finishes, the host sends its commits and reply back to the opencode session, where they're applied the same way.
+
+If you didn't take the previous result (for example, it stayed on its own branch), the next handoff starts a fresh thread.
 
 ### Durability
 
@@ -210,10 +221,11 @@ handoff-daemon config unset <key>             # back to the default
 | `interactionMode` | `default` | `plan` makes the agent plan instead of editing. |
 | `branchPrefix` | `handoff/` | Prefix for each handoff's branch. |
 | `instructions` | none | Extra instructions appended to every prompt. `@path` reads them from a file. |
-| `promptTranscriptChars` | `60000` | How much of the session transcript goes in the prompt. The full transcript is always in a file the agent can read. |
+| `promptTranscriptChars` | `4000` | Without a brief from the client, how much of the latest exchange the prompt shows. The full transcript is always a file the agent can read. |
 | `concurrency` | `2` | Handoffs that run at the same time. |
 | `jobTimeoutMinutes` | `240` | After this long, the thread is interrupted and whatever it has done is returned. |
-| `reposDir`, `jobsDir` | `~/handoff/...` | Where repository mirrors and scratch files live. |
+| `reposDir` | `~/handoff` | Parent folder for project folders, one per client repository. |
+| `jobsDir` | `~/.local/state/handoff/jobs` | Per-handoff scratch files: bundles, `brief.md`, `transcript.md`. |
 
 The relay URL, token, keys and T3 login live in `~/.config/handoff/daemon.json`.
 
@@ -224,7 +236,8 @@ The relay URL, token, keys and T3 login live in `~/.config/handoff/daemon.json`.
 | `model` | host default | Lead model for this client's handoffs, as a short name or spec. It must be allowed on the host. |
 | `apply` | `auto` | `auto` fast-forwards your branch when it hasn't moved. `branch` always leaves results on their own branch. |
 | `resume` | `true` | Let the local agent take a turn when a result arrives. |
-| `transcriptChars` | `400000` | Maximum session transcript sent with a handoff. |
+| `transcriptChars` | `120000` | Maximum session transcript sent with a handoff. |
+| `brief` | `true` | Have the session's model write the brief. `false` sends your request as typed. |
 
 Client settings live in `~/.config/handoff/client.json`, and pairing details in `device.json`.
 

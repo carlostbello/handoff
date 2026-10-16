@@ -137,6 +137,8 @@ export interface T3Thread {
   worktreePath: string | null
   pendingRequestCount: number
   latestRunId: string | null
+  providerInstanceId?: string | null
+  model?: string | null
 }
 
 export interface T3Item {
@@ -311,6 +313,25 @@ export class T3 {
   }
 
   /** Final assistant message of the latest run, fully reassembled. */
+  /** The newest user message in a thread (e.g. what the user typed in T3), shortened. */
+  async lastUserMessage(threadId: string, maxChars = 2000): Promise<string> {
+    let after: number | null = null
+    let last: T3Item | undefined
+    for (;;) {
+      const page: { items: T3Item[]; nextPosition: number | null; hasMore: boolean } = await this.call("t3_thread_read", {
+        threadId,
+        view: "messages",
+        limit: 100,
+        maxCharsPerItem: maxChars,
+        ...(after != null ? { afterPosition: after } : {}),
+      })
+      for (const item of page.items) if (item.type === "user_message") last = item
+      if (!page.hasMore || page.nextPosition == null) break
+      after = page.nextPosition
+    }
+    return (last?.text ?? "").trim()
+  }
+
   async finalAssistantText(threadId: string): Promise<string> {
     let after: number | null = null
     let last: T3Item | undefined
@@ -356,6 +377,16 @@ export class T3 {
 
   async respond(threadId: string, requestId: string, answers: Record<string, unknown>): Promise<void> {
     await this.call("t3_pending_request_respond", { threadId, requestId, answers })
+  }
+
+  /** Switch a thread's model for its next run. */
+  async configure(threadId: string, modelSelection: Record<string, unknown>): Promise<void> {
+    await this.call("t3_thread_configure", { threadId, modelSelection })
+  }
+
+  /** Send a message to a thread: starts it if idle, otherwise queues behind the current turn. */
+  async send(threadId: string, message: string, clientRequestId: string): Promise<void> {
+    await this.call("t3_thread_send", { threadId, message, mode: "auto", clientRequestId })
   }
 
   async interrupt(threadId: string, reason: string, clientRequestId: string): Promise<void> {

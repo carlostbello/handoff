@@ -5,7 +5,7 @@
 import { mkdir, readFile, rename, writeFile, rm, open as openFile } from "node:fs/promises"
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
-import type { KeyPair } from "@handoff/shared"
+import type { HandoffBrief, KeyPair } from "@handoff/shared"
 
 const CONFIG_DIR = process.env.HANDOFF_CONFIG_DIR ?? join(homedir(), ".config", "handoff")
 const STATE_DIR = process.env.HANDOFF_STATE_DIR ?? join(homedir(), ".local", "state", "handoff")
@@ -35,9 +35,11 @@ export interface ClientSettings {
   resume: boolean
   /** Maximum characters of session transcript sent with a handoff. */
   transcriptChars: number
+  /** Have this session's model write a task brief for the host agent before handing off. */
+  brief: boolean
 }
 
-export const DEFAULT_SETTINGS: ClientSettings = { apply: "auto", resume: true, transcriptChars: 400_000 }
+export const DEFAULT_SETTINGS: ClientSettings = { apply: "auto", resume: true, transcriptChars: 120_000, brief: true }
 
 export type DeviceJobPhase =
   | "packing"
@@ -63,6 +65,10 @@ export interface DeviceJob {
   instructions: string
   model?: string
   apply?: ClientSettings["apply"]
+  /** The brief this session's model wrote for the handoff. */
+  brief?: HandoffBrief
+  /** "host": an update the host sent from the conversation's T3 thread, not a handoff from here. */
+  origin?: "handoff" | "host"
   createdAt: number
   lastStatus?: string
   threadId?: string

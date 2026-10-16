@@ -151,6 +151,10 @@ async function route(request: Request, env: Env): Promise<Response> {
     await hub.revokeDevice(m[1]!)
     return json({ ok: true })
   }
+  if (method === "POST" && path === "/v1/host/jobs") {
+    const { id, deviceId } = await body<{ id: string; deviceId: string }>(request)
+    return json({ job: await hub.createHostJob(deviceId, id) })
+  }
   if (method === "GET" && path === "/v1/host/jobs") {
     const status = (url.searchParams.get("status") as JobStatus | null) ?? undefined
     return json({ jobs: await hub.listJobs(principal, status) })

@@ -78,10 +78,10 @@ export const SETTINGS: Record<Key, Setting> = {
     parse: async (v) => (v.startsWith("@") ? (await readFile(path.parse(v.slice(1)) as string, "utf8")).trim() : v),
     format: (v) => (v ? JSON.stringify(v) : "(none)"),
   },
-  promptTranscriptChars: { ...integer(0), description: "Characters of the session transcript included inline in the prompt; the full transcript is always in a file." },
+  promptTranscriptChars: { ...integer(0), description: "Without a brief from the client, characters of the latest exchange shown in the prompt. The full transcript is always a file the agent can read." },
   concurrency: { ...integer(1), description: "Handoffs run at the same time." },
   jobTimeoutMinutes: { ...integer(1), description: "Interrupt a handoff thread after this many minutes and return what it has." },
-  reposDir: { ...path, description: "Where repository mirrors live (each is a T3 project)." },
+  reposDir: { ...path, description: "Parent folder for project folders, one per client repository (each is a T3 project)." },
   jobsDir: { ...path, description: "Per-handoff scratch files." },
 }
 

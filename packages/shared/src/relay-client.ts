@@ -163,6 +163,11 @@ export class HostClient extends BaseClient {
     await this.request("DELETE", `/v1/host/devices/${id}`)
   }
 
+  /** Start a job for a paired device: an update the host pushes without a request. */
+  async createJob(id: string, deviceId: string): Promise<JobRecord> {
+    return (await this.json<{ job: JobRecord }>("POST", "/v1/host/jobs", { id, deviceId })).job
+  }
+
   async jobs(status?: JobStatus): Promise<JobRecord[]> {
     const q = status ? `?status=${status}` : ""
     return (await this.json<{ jobs: JobRecord[] }>("GET", `/v1/host/jobs${q}`)).jobs

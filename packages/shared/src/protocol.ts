@@ -65,7 +65,10 @@ export interface RequestManifest {
   jobId: string
   deviceId: string
   createdAt: number
+  /** What the user typed, verbatim. The host reads model names from this. */
   instructions: string
+  /** Written by the client's model from the session; absent if it couldn't write one. */
+  brief?: HandoffBrief
   repo: {
     /** Stable random id the device assigns per repository. */
     id: string
@@ -93,15 +96,48 @@ export interface RequestManifest {
   }
 }
 
+/** A task brief the client's model writes from the session before handing off. */
+export interface HandoffBrief {
+  /** Short imperative title, e.g. "Add retry logic to the uploader". */
+  title: string
+  /** Few-word kebab-case name for the branch. */
+  slug: string
+  /** Human-friendly name for the repository's project on the host, e.g. "Recipe Planner". */
+  projectName: string
+  /** Self-contained markdown brief: goal, context, remaining work, constraints, done-when. */
+  task: string
+  /**
+   * How much of the prior session the host agent should get:
+   * "full": read the transcript; "reference": the brief is enough, transcript on hand if needed;
+   * "none": the user wants a fresh start, so don't pass the transcript at all.
+   */
+  context: "full" | "reference" | "none"
+  /** Repository-relative files the agent should read first. */
+  files: string[]
+}
+
 /** Header of the result container the host returns (encrypted to the device key). */
 export interface ResultManifest {
   v: typeof PROTOCOL_VERSION
   jobId: string
+  /**
+   * "handoff": the answer to a request the device sent.
+   * "host": an update the host sent on its own, after more work happened in the
+   * conversation's T3 thread (e.g. the user replied to the agent in T3 Code).
+   */
+  origin: "handoff" | "host"
+  /** The opencode session this conversation belongs to. */
+  sessionId: string
+  /** For "host" updates: the device's earlier job in this conversation. */
+  parentJobId?: string
+  /** For "host" updates: the latest message the user sent the agent in T3, if any. */
+  request?: string
   outcome: "succeeded" | "failed"
   /** Branch inside the bundle holding the agent's commits (child of the snapshot). */
   branch: string
   /** Tip of `branch`, or null if no bundle (no commits). */
   head: string | null
+  /** The commit this result builds on: the request's snapshot, or for updates the last commit delivered. */
   snapshot: string
   commits: Array<{ sha: string; subject: string }>
   diffstat: string

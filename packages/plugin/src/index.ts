@@ -24,6 +24,9 @@ function makeOpencode(ctx: Context): Opencode {
       const [info, messages] = await Promise.all([ctx.session.get({ sessionID }), ctx.session.context({ sessionID })])
       return { info, messages }
     },
+    async generate(sessionID, prompt) {
+      return (await ctx.session.generate({ sessionID, prompt })).text
+    },
     async post(sessionID, text, { resume, description }) {
       try {
         await ctx.session.get({ sessionID })

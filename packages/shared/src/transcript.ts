@@ -9,25 +9,25 @@ function clip(text: string, max: number): string {
   return text.length <= max ? text : `${text.slice(0, max)}\n…[truncated ${text.length - max} chars]`
 }
 
-function toolLine(part: Json): string {
+/**
+ * A tool call as one line. Outputs are left out: the host agent has the repository
+ * and can repeat any read or command itself. Errors are kept, briefly.
+ */
+function toolLine(part: Json): string | null {
+  const name = str(part.name)
+  if (SKIPPED_TOOLS.has(name)) return null
   const state = (part.state ?? {}) as Json
   const input = state.input
-  let args = typeof input === "string" ? input : JSON.stringify(input ?? {})
-  args = clip(args, 300)
-  const status = str(state.status)
-  let out = ""
-  if (status === "completed" && Array.isArray(state.content)) {
-    out = (state.content as Json[])
-      .map((c) => str(c.text))
-      .filter(Boolean)
-      .join("\n")
-  } else if (status === "error") {
-    out = `ERROR: ${JSON.stringify(state.error ?? "")}`
-  }
-  return `- tool \`${str(part.name)}\` ${args}${out ? `\n  → ${clip(out.replace(/\n/g, "\n    "), 600)}` : ""}`
+  const args = clip(typeof input === "string" ? input : JSON.stringify(input ?? {}), 200).replace(/\n/g, " ")
+  const error = str(state.status) === "error" ? ` → ERROR: ${clip(JSON.stringify(state.error ?? ""), 200)}` : ""
+  return `- ran \`${name}\` ${args}${error}`
 }
 
-export function condenseTranscript(exported: unknown, maxChars = 80_000): string {
+/** Tools whose calls tell the host agent nothing (loading skills, todo bookkeeping). */
+const SKIPPED_TOOLS = new Set(["skill", "todowrite", "todoread"])
+const MAX_TEXT_PER_MESSAGE = 2000
+
+export function condenseTranscript(exported: unknown, maxChars = 120_000): string {
   const data = ((exported as Json)?.data ?? exported) as Json
   const info = (data?.info ?? {}) as Json
   const messages = (Array.isArray(data?.messages) ? data.messages : []) as Json[]
@@ -36,7 +36,7 @@ export function condenseTranscript(exported: unknown, maxChars = 80_000): string
   for (const m of messages) {
     switch (m.type) {
       case "user":
-        blocks.push(`### User\n${str(m.text)}`)
+        blocks.push(`### User\n${clip(str(m.text), 6000)}`)
         break
       case "synthetic":
         blocks.push(`### Note${m.description ? ` (${str(m.description)})` : ""}\n${clip(str(m.text), 4000)}`)
@@ -46,15 +46,19 @@ export function condenseTranscript(exported: unknown, maxChars = 80_000): string
         break
       case "compaction": {
         const summary = str(m.summary) || str((m as Json).text)
-        if (summary) blocks.push(`### Earlier conversation (compacted)\n${summary}`)
+        // Demote the summary's own headings so they don't read as transcript entries.
+        if (summary) blocks.push(`### Earlier conversation (summary)\n${summary.replace(/^(#{1,3}) /gm, "#### ")}`)
         break
       }
       case "assistant": {
         const parts = (Array.isArray(m.content) ? m.content : []) as Json[]
         const lines: string[] = []
         for (const p of parts) {
-          if (p.type === "text" && str(p.text).trim()) lines.push(str(p.text).trim())
-          else if (p.type === "tool") lines.push(toolLine(p))
+          if (p.type === "text" && str(p.text).trim()) lines.push(clip(str(p.text).trim(), MAX_TEXT_PER_MESSAGE).replace(/^(#{1,3}) /gm, "#### "))
+          else if (p.type === "tool") {
+            const line = toolLine(p)
+            if (line) lines.push(line)
+          }
         }
         if (lines.length) blocks.push(`### Assistant\n${lines.join("\n")}`)
         break

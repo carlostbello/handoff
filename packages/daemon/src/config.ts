@@ -19,7 +19,7 @@ export interface DaemonConfig {
   /** Extra headers for the relay, e.g. Cloudflare Access service-token headers. */
   relayHeaders?: Record<string, string>
   keys: KeyPair
-  /** Where repository mirrors live; each one is registered as a T3 project. */
+  /** Parent folder for project folders, one per client repository; each is a T3 project. */
   reposDir: string
   /** Per-job scratch: decrypted bundles, transcripts. */
   jobsDir: string
@@ -47,7 +47,7 @@ export interface DaemonConfig {
   branchPrefix: string
   /** Extra instructions appended to every handoff prompt. */
   instructions: string
-  /** How much of the session transcript goes inline in the prompt (the rest stays in a file). */
+  /** Without a brief, how much of the latest exchange goes inline in the prompt; the full transcript is a file. */
   promptTranscriptChars: number
   concurrency: number
   /** Give up on a T3 thread after this long. */
@@ -55,10 +55,10 @@ export interface DaemonConfig {
 }
 
 export function defaultConfig(): Omit<DaemonConfig, "relayUrl" | "hostToken" | "keys"> {
-  const base = join(homedir(), "handoff")
   return {
-    reposDir: join(base, "repos"),
-    jobsDir: join(base, "jobs"),
+    // One folder per client repository, named after the project: ~/handoff/<name>.
+    reposDir: join(homedir(), "handoff"),
+    jobsDir: join(STATE_DIR, "jobs"),
     t3: { runtimeFile: join(homedir(), ".t3", "userdata", "server-runtime.json") },
     model: null,
     leadModels: [],
@@ -68,7 +68,7 @@ export function defaultConfig(): Omit<DaemonConfig, "relayUrl" | "hostToken" | "
     interactionMode: "default",
     branchPrefix: "handoff/",
     instructions: "",
-    promptTranscriptChars: 60_000,
+    promptTranscriptChars: 4_000,
     concurrency: 2,
     jobTimeoutMinutes: 240,
   }

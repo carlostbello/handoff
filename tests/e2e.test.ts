@@ -422,4 +422,19 @@ describe.skipIf(!url)("handoff end to end", () => {
     await settle()
     expect(posted.length).toBe(count)
   }, 60_000)
+
+  it("hands off again with nothing changed since the last result (empty bundle)", async () => {
+    // ses_conv's last update was applied by fast-forward, so the snapshot is a commit the host already has.
+    expect(sh(work, "status", "--porcelain")).toBe("")
+    const before = launches.length
+    await engine.handle("ses_nochange", "/handoff review what is there")
+    const state = JSON.parse(readFileSync(join(root, "state", "device-state.json"), "utf8"))
+    const job = Object.values(state.jobs).find((j: any) => j.instructions === "review what is there") as { id: string; base: string; snapshot: string }
+    expect(job.base).toBe(job.snapshot) // nothing new to send
+    await runner.runOnce()
+    expect(launches.length).toBe(before + 1)
+    await engine.pollOnce()
+    const device = JSON.parse(readFileSync(join(root, "config", "device.json"), "utf8"))
+    expect((await new shared.DeviceClient({ url: url!, token: device.token }).getJob(job.id)).status).toBe("delivered")
+  }, 60_000)
 })

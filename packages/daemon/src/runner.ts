@@ -414,13 +414,18 @@ export class Runner {
 
     await this.notify(job, "Host received the handoff; unpacking repository")
     const baseBranch = `handoff-base/${job.id}`
-    try {
-      await git(["fetch", "--no-tags", bundlePath, `+${manifest.repo.snapshotRef}:refs/heads/${baseBranch}`], { cwd: repoDir })
-    } catch (err) {
-      if (err instanceof GitError && /prerequisite|missing|not a valid|did not send all necessary objects|lacks/i.test(err.stderr)) {
-        throw Object.assign(new Error("Host is missing the base commit for an incremental bundle"), { code: "needs_full_bundle" })
+    const needsFull = () => Object.assign(new Error("Host is missing the base commit for an incremental bundle"), { code: "needs_full_bundle" })
+    if (bundle.length === 0) {
+      // The client sends no bundle when nothing changed since what the host last had.
+      if (!(await gitOk(["cat-file", "-e", `${manifest.repo.snapshot}^{commit}`], { cwd: repoDir }))) throw needsFull()
+      await git(["update-ref", `refs/heads/${baseBranch}`, manifest.repo.snapshot], { cwd: repoDir })
+    } else {
+      try {
+        await git(["fetch", "--no-tags", bundlePath, `+${manifest.repo.snapshotRef}:refs/heads/${baseBranch}`], { cwd: repoDir })
+      } catch (err) {
+        if (err instanceof GitError && /prerequisite|missing|not a valid|did not send all necessary objects|lacks/i.test(err.stderr)) throw needsFull()
+        throw err
       }
-      throw err
     }
     const snapshot = await revParse(repoDir, baseBranch)
     if (snapshot !== manifest.repo.snapshot) throw new Error(`snapshot mismatch: got ${snapshot}, expected ${manifest.repo.snapshot}`)

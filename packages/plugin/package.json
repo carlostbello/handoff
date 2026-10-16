@@ -1,0 +1,16 @@
+{
+  "name": "@handoff/opencode-plugin",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "esbuild src/index.ts --bundle --platform=node --format=esm --target=es2023 --outfile=dist/handoff/server.js && esbuild src/tui.ts --bundle --platform=node --format=esm --target=es2023 --outfile=dist/handoff/tui.js && node scripts/write-dist-package.mjs",
+    "typecheck": "tsc -p ."
+  },
+  "dependencies": {
+    "@handoff/shared": "*"
+  },
+  "devDependencies": {
+    "@opencode/plugin": "2.0.26"
+  }
+}

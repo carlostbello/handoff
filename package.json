@@ -1,0 +1,27 @@
+{
+  "name": "handoff",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "typecheck": "for p in shared relay daemon plugin; do tsc -p packages/$p || exit 1; done",
+    "test": "vitest run",
+    "build": "npm run build -w @handoff/daemon && npm run build -w @handoff/opencode-plugin",
+    "package:plugin": "npm run build -w @handoff/opencode-plugin && mkdir -p dist && tar -C packages/plugin/dist/handoff -czf dist/handoff-plugin.tar.gz ."
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "esbuild": "^0.28.2",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.4"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "allowScripts": {
+    "esbuild@0.28.2": true,
+    "workerd@1.20261012.1": true
+  }
+}

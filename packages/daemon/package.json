@@ -1,0 +1,15 @@
+{
+  "name": "@handoff/daemon",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": { "handoff-daemon": "dist/handoff-daemon.mjs" },
+  "scripts": {
+    "build": "esbuild src/cli.ts --bundle --platform=node --format=esm --target=node24 --outfile=dist/handoff-daemon.mjs --banner:js='#!/usr/bin/env node\nimport{createRequire as __cr}from\"module\";const require=__cr(import.meta.url);'",
+    "typecheck": "tsc -p ."
+  },
+  "dependencies": {
+    "@handoff/shared": "*",
+    "@modelcontextprotocol/sdk": "^1.32.1"
+  }
+}

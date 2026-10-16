@@ -1,0 +1,34 @@
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "handoff-relay",
+	"main": "src/index.ts",
+	"compatibility_date": "2026-10-01",
+	"workers_dev": true,
+	"preview_urls": false,
+	"durable_objects": {
+		"bindings": [
+			{
+				"name": "HUB",
+				"class_name": "Hub"
+			}
+		]
+	},
+	"migrations": [
+		{
+			"tag": "v1",
+			"new_sqlite_classes": [
+				"Hub"
+			]
+		}
+	],
+	"r2_buckets": [
+		{
+			"binding": "BLOBS",
+			"bucket_name": "handoff-blobs"
+		}
+	],
+	"observability": {
+		"enabled": true
+	}
+	// Secret (set with `wrangler secret put HOST_TOKEN`): HOST_TOKEN
+}

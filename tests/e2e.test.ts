@@ -428,6 +428,20 @@ describe.skipIf(!url)("handoff end to end", () => {
     expect(msg.text).toMatch(/fast-forwarded/)
     expect(sh(work, "log", "-1", "--format=%s")).toBe("Agent: tweak from T3")
 
+    // An update whose result event this machine lost (e.g. handling it failed) is still picked up.
+    fake.simulateReply(threadId, { commit: "second tweak", text: "Second tweak done." })
+    await runner.pollConversations()
+    await new Promise((r) => setTimeout(r, 80))
+    await runner.pollConversations()
+    const statePath = join(root, "state", "device-state.json")
+    const device = JSON.parse(readFileSync(join(root, "config", "device.json"), "utf8"))
+    const deviceState = JSON.parse(readFileSync(statePath, "utf8"))
+    const { cursor } = await new shared.DeviceClient({ url: url!, token: device.token }).events(deviceState.eventCursor)
+    writeFileSync(statePath, JSON.stringify({ ...deviceState, eventCursor: cursor }))
+    await engine.pollOnce()
+    expect(posted.at(-1)!.text).toContain("Second tweak done.")
+    expect(sh(work, "log", "-1", "--format=%s")).toBe("Agent: second tweak")
+
     // A new run with nothing new in it (e.g. a wake-up T3 cancelled before it started) sends nothing.
     const count = posted.length
     fake.simulateReply(threadId)

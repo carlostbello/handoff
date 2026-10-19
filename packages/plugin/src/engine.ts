@@ -83,6 +83,8 @@ export class Engine {
   private readonly owner = `${process.pid}-${Math.random().toString(36).slice(2)}`
   private timer: ReturnType<typeof setTimeout> | null = null
   private polling = false
+  /** Finished relay jobs that aren't updates for this machine (e.g. results whose local record is gone). */
+  private readonly unclaimable = new Set<string>()
   /** Only a started engine polls; command-handling engines stay passive. */
   private stopped = true
 
@@ -410,6 +412,17 @@ export class Engine {
         else if (remote?.status === "failed" && remote.errorCode !== "needs_full_bundle") {
           await updateJob(job.id, { phase: "failed", lastStatus: `failed on the host (${remote.errorCode ?? "see events"})` })
         }
+      }
+
+      // Same for updates from T3: they aren't in local state until received, so a lost or failed
+      // result event would otherwise strand them on the relay. Pick up any finished, unclaimed one.
+      const known = (await loadState()).jobs
+      const remoteJobs = await relay.listJobs().catch(() => [])
+      for (const remote of remoteJobs.filter((j) => j.status === "done" && !known[j.id] && !this.unclaimable.has(j.id))) {
+        await this.receiveUpdate(config, relay, remote.id).catch((err: unknown) => {
+          if (!(err instanceof RelayError)) this.unclaimable.add(remote.id)
+          this.opencode.log(`handoff: update ${remote.id} failed: ${(err as Error).message}`)
+        })
       }
       return Object.values((await loadState()).jobs).some((j) => ["uploading", "submitted", "applying"].includes(j.phase))
     } finally {

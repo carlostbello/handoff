@@ -33,7 +33,13 @@ export interface RelayClientOptions {
   headers?: Record<string, string>
   fetch?: typeof fetch
   retries?: number
+  /** Per-attempt limit, so a connection that dies mid-request (sleep, network change) can't hang a caller. */
+  timeoutMs?: number
 }
+
+const DEFAULT_TIMEOUT_MS = 120_000
+/** Blob parts and downloads are larger; allow for slow links. */
+const BLOB_TIMEOUT_MS = 15 * 60_000
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
@@ -43,7 +49,7 @@ class BaseClient {
     this.base = opts.url.replace(/\/+$/, "")
   }
 
-  protected async request(method: string, path: string, body?: BodyInit | object, extra?: Record<string, string>): Promise<Response> {
+  protected async request(method: string, path: string, body?: BodyInit | object, extra?: Record<string, string>, timeoutMs?: number): Promise<Response> {
     const headers: Record<string, string> = { ...this.opts.headers, ...extra }
     if (this.opts.token) headers.authorization = `Bearer ${this.opts.token}`
     let payload: BodyInit | undefined
@@ -59,7 +65,7 @@ class BaseClient {
     for (let attempt = 0; ; attempt++) {
       let res: Response
       try {
-        res = await doFetch(this.base + path, { method, headers, body: payload })
+        res = await doFetch(this.base + path, { method, headers, body: payload, signal: AbortSignal.timeout(timeoutMs ?? this.opts.timeoutMs ?? DEFAULT_TIMEOUT_MS) })
       } catch (err) {
         if (attempt >= retries) throw new RelayError(`network error: ${(err as Error).message}`, 0)
         await sleep(Math.min(30_000, 500 * 2 ** attempt))
@@ -88,15 +94,15 @@ class BaseClient {
     const count = Math.max(1, Math.ceil(data.length / PART_SIZE))
     for (let i = 0; i < count; i++) {
       const chunk = new Uint8Array(data.subarray(i * PART_SIZE, (i + 1) * PART_SIZE)) as Bytes
-      const res = await this.json<UploadedPart>("PUT", `${prefix}/parts/${i + 1}`, chunk)
-      parts.push(res)
+      const res = await this.request("PUT", `${prefix}/parts/${i + 1}`, chunk, undefined, BLOB_TIMEOUT_MS)
+      parts.push((await res.json()) as UploadedPart)
     }
     const complete: CompleteUploadRequest = { parts, size: data.length }
     await this.request("POST", `${prefix}/complete`, complete)
   }
 
   protected async downloadBlob(path: string): Promise<Bytes> {
-    const res = await this.request("GET", path)
+    const res = await this.request("GET", path, undefined, undefined, BLOB_TIMEOUT_MS)
     return new Uint8Array(await res.arrayBuffer()) as Bytes
   }
 

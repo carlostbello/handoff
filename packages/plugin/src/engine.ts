@@ -76,6 +76,8 @@ const IDLE_POLL_MS = 5 * 60_000
 const BRIEF_TIMEOUT_MS = 90_000
 const BRIEF_ATTEMPTS = 2
 const LEASE_MS = 60_000
+/** Longer than any single relay call may take (blob transfers allow 15 minutes). */
+const POLL_STUCK_MS = 20 * 60_000
 
 const short = (id: string) => id.slice(-6).toLowerCase()
 
@@ -83,6 +85,8 @@ export class Engine {
   private readonly owner = `${process.pid}-${Math.random().toString(36).slice(2)}`
   private timer: ReturnType<typeof setTimeout> | null = null
   private polling = false
+  private pollStartedAt = 0
+  private pollPass = 0
   /** Finished relay jobs that aren't updates for this machine (e.g. results whose local record is gone). */
   private readonly unclaimable = new Set<string>()
   /** Only a started engine polls; command-handling engines stay passive. */
@@ -373,8 +377,14 @@ export class Engine {
 
   /** One polling pass. Returns true while any job is still in flight. */
   async pollOnce(): Promise<boolean> {
-    if (this.polling) return true
+    if (this.polling) {
+      if (Date.now() - this.pollStartedAt < POLL_STUCK_MS) return true
+      // A pass that never finished (e.g. a call into opencode that never returned) must not stop polling for good.
+      this.opencode.log(`handoff: previous poll still running after ${Math.round((Date.now() - this.pollStartedAt) / 60_000)} minutes; starting a new one`)
+    }
+    const pass = ++this.pollPass
     this.polling = true
+    this.pollStartedAt = Date.now()
     try {
       const config = await loadConfig()
       if (!config) return false
@@ -426,7 +436,7 @@ export class Engine {
       }
       return Object.values((await loadState()).jobs).some((j) => ["uploading", "submitted", "applying"].includes(j.phase))
     } finally {
-      this.polling = false
+      if (pass === this.pollPass) this.polling = false
     }
   }
 

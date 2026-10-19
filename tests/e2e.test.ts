@@ -331,6 +331,18 @@ describe.skipIf(!url)("handoff end to end", () => {
     expect(existsSync(join(work, "subagent.txt"))).toBe(true)
   }, 60_000)
 
+  it("keeps waiting while the lead runs, even when T3 reports a cancelled wake-up as the newest run", async () => {
+    fakeHooks.leadStillRunningPolls = 3
+    writeFileSync(join(work, "busy.txt"), "x\n")
+    await engine.handle("ses_busy", "/handoff research and write it up")
+    await runner.runOnce()
+    fakeHooks.leadStillRunningPolls = undefined
+    await engine.pollOnce()
+    const msg = posted.at(-1)!.text
+    expect(msg).toContain("Lead: finish after the subagent reported")
+    expect(existsSync(join(work, "lead.txt"))).toBe(true)
+  }, 60_000)
+
   it("has the session's model write the brief, and names the host's project folder after it", async () => {
     const other = join(root, "other-repo")
     execFileSync("mkdir", ["-p", other])

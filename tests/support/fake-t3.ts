@@ -21,6 +21,12 @@ export interface FakeHooks {
    * working for this many polls, then the subagent commits and finishes.
    */
   subagentPolls?: number
+  /**
+   * Simulate a subagent's wake-up that T3 cancelled before it started because the
+   * lead was still busy: t3_thread_wait reports that cancelled run while the lead's
+   * own run keeps going for this many status checks, then commits and finishes.
+   */
+  leadStillRunningPolls?: number
 }
 
 export function createFakeT3(worktreesDir: string, hooks: FakeHooks = {}) {
@@ -35,6 +41,7 @@ export function createFakeT3(worktreesDir: string, hooks: FakeHooks = {}) {
   }
   const launches: FakeLaunch[] = []
   const subagents = new Map<string, number>()
+  const leadRunning = new Map<string, number>()
   const t3 = {
     launches,
     sends,
@@ -72,11 +79,13 @@ export function createFakeT3(worktreesDir: string, hooks: FakeHooks = {}) {
       threads.set(threadId, { worktree, branch: ws.branch, title: args.title, projectId: args.projectId, run: 1, text: "Made the requested change and left notes. Verified by reading the file." })
       launches.push({ message: args.message, branch: ws.branch, baseRef: ws.baseRef, title: args.title, args })
       if (hooks.subagentPolls) subagents.set(threadId, hooks.subagentPolls)
+      if (hooks.leadStillRunningPolls) leadRunning.set(threadId, hooks.leadStillRunningPolls)
       hooks.onLaunch?.()
       return threadId
     },
     async wait(threadId: string) {
-      return { threadId, runId: `r${threads.get(threadId)?.run ?? 1}`, status: "completed", timedOut: false }
+      const status = leadRunning.has(threadId) ? "cancelled" : "completed"
+      return { threadId, runId: `r${threads.get(threadId)?.run ?? 1}`, status, timedOut: false }
     },
     configures: [] as Array<{ threadId: string; modelSelection: Record<string, unknown> }>,
     async configure(threadId: string, modelSelection: Record<string, unknown>) {
@@ -107,7 +116,15 @@ export function createFakeT3(worktreesDir: string, hooks: FakeHooks = {}) {
       const t = threads.get(threadId)!
       return { threadId, projectId: t.projectId, title: t.title, status: "completed", branch: t.branch, worktreePath: t.worktree, pendingRequestCount: 0, latestRunId: `r${t.run}` }
     },
-    async finalRunStatus() {
+    async finalRunStatus(threadId: string) {
+      const left = leadRunning.get(threadId)
+      if (left === undefined) return "completed"
+      if (left > 0) {
+        leadRunning.set(threadId, left - 1)
+        return "running"
+      }
+      leadRunning.delete(threadId)
+      commitIn(threads.get(threadId)!.worktree, "lead.txt", "finished", "Lead: finish after the subagent reported")
       return "completed"
     },
     async lastUserMessage(threadId: string) {

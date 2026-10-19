@@ -641,12 +641,18 @@ export class Runner {
         } else if (idleSince === null) {
           idleSince = Date.now()
         } else if (Date.now() - idleSince >= this.settleMs) {
+          // t3_thread_wait reports the newest run. When that is a subagent's wake-up that T3 cancelled
+          // before it started (the lead was still busy), the lead's own run is still going: keep waiting.
           const status = await this.t3.finalRunStatus(threadId)
-          if (status !== "completed") {
-            // Interrupted or failed runs still return whatever the agent committed.
-            await this.notify(job, `T3 run ended with status ${status}; collecting partial results`)
+          if (ACTIVE_STATUSES.includes(status)) {
+            idleSince = null
+          } else {
+            if (status !== "completed") {
+              // Interrupted or failed runs still return whatever the agent committed.
+              await this.notify(job, `T3 run ended with status ${status}; collecting partial results`)
+            }
+            break
           }
-          break
         }
         await new Promise((r) => setTimeout(r, Math.min(5000, this.settleMs)))
       }

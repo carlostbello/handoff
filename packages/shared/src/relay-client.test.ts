@@ -15,4 +15,19 @@ describe("relay client", () => {
     expect((err as RelayError).retryable).toBe(true)
     expect(calls).toBe(2)
   })
+
+  it("falls back to separate calls on a relay without /v1/sync, and remembers", async () => {
+    const paths: string[] = []
+    const fake = (async (url: string) => {
+      const path = new URL(url).pathname
+      paths.push(path)
+      if (path === "/v1/sync") return new Response(JSON.stringify({ error: "not found" }), { status: 404 })
+      if (path === "/v1/events") return Response.json({ events: [], cursor: 7 })
+      return Response.json({ jobs: [{ id: "a", status: "done" }, { id: "b", status: "delivered" }] })
+    }) as unknown as typeof fetch
+    const client = new DeviceClient({ url: "http://relay.invalid", token: "t", fetch: fake, retries: 0 })
+    expect(await client.sync(0)).toEqual({ events: [], cursor: 7, jobs: [{ id: "a", status: "done" }] })
+    await client.sync(7)
+    expect(paths.filter((p) => p === "/v1/sync")).toHaveLength(1)
+  })
 })

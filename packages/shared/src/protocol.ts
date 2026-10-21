@@ -152,6 +152,8 @@ export interface StatusPayload {
   threadId?: string
   /** Show this to the user now, not just in /handoff status. */
   announce?: boolean
+  /** After a result was delivered: whether the T3 thread is working again (busy) or has stopped (idle). */
+  activity?: "busy" | "idle"
 }
 export interface QuestionPayload {
   requestId: string

@@ -397,9 +397,12 @@ export class Engine {
       // Resume uploads interrupted by a shutdown.
       for (const job of inFlight.filter((j) => j.phase === "uploading")) await this.resumeUpload(job)
 
+      // One request returns new events and this device's open jobs (each extra request costs relay quota).
       let cursor = state.eventCursor
+      let open: JobRecord[] = []
       for (;;) {
-        const { events, cursor: next } = await relay.events(cursor)
+        const { events, cursor: next, jobs } = await relay.sync(cursor)
+        open = jobs
         for (const ev of events) {
           try {
             await this.handleEvent(config, relay, ev)
@@ -413,9 +416,11 @@ export class Engine {
         if (events.length < 200) break
       }
 
-      // Safety net for missed events: reconcile with relay job status.
+      // Safety net for missed events: reconcile in-flight jobs with their relay status. Jobs missing
+      // from the open list have ended (cancelled, failed or gone); only those need a lookup.
+      const openById = new Map(open.map((j) => [j.id, j]))
       for (const job of Object.values((await loadState()).jobs).filter((j) => ["submitted", "applying"].includes(j.phase))) {
-        const remote = await relay.getJob(job.id).catch((e: unknown) => (e instanceof RelayError && e.status === 404 ? null : undefined))
+        const remote = openById.get(job.id) ?? (await relay.getJob(job.id).catch((e: unknown) => (e instanceof RelayError && e.status === 404 ? null : undefined)))
         if (remote === null) await updateJob(job.id, { phase: "failed", lastStatus: "job no longer exists on the relay" })
         else if (remote?.status === "done") await this.deliver(config, relay, job.id)
         else if (remote?.status === "cancelled") await this.finishCancelled(job)
@@ -427,8 +432,7 @@ export class Engine {
       // Same for updates from T3: they aren't in local state until received, so a lost or failed
       // result event would otherwise strand them on the relay. Pick up any finished, unclaimed one.
       const known = (await loadState()).jobs
-      const remoteJobs = await relay.listJobs().catch(() => [])
-      for (const remote of remoteJobs.filter((j) => j.status === "done" && !known[j.id] && !this.unclaimable.has(j.id))) {
+      for (const remote of open.filter((j) => j.status === "done" && !known[j.id] && !this.unclaimable.has(j.id))) {
         await this.receiveUpdate(config, relay, remote.id).catch((err: unknown) => {
           if (!(err instanceof RelayError)) this.unclaimable.add(remote.id)
           this.opencode.log(`handoff: update ${remote.id} failed: ${(err as Error).message}`)
@@ -461,6 +465,11 @@ export class Engine {
     switch (ev.kind) {
       case "status": {
         const p = await read<StatusPayload>()
+        if (p.activity) {
+          // Activity in the thread after this job's result arrived; the job's own outcome stays as it was.
+          await updateJob(job.id, { remote: { active: p.activity === "busy", note: p.message, since: Date.now() } })
+          break
+        }
         await updateJob(job.id, { lastStatus: p.message, ...(p.threadId ? { threadId: p.threadId } : {}) })
         if (p.announce) await this.opencode.post(job.sessionID, `Handoff \`${short(job.id)}\`: ${p.message}`, { resume: false, description: NOTICE }).catch(() => false)
         break
@@ -535,7 +544,7 @@ export class Engine {
       const repo = s.repos[job.repoTop]
       if (repo && result.knownCommit) repo.knownCommit = result.knownCommit
       const j = s.jobs[jobId]
-      if (j) Object.assign(j, { phase: "applied", resultBranch: result.branch, lastStatus: describeOutcome(outcome, result) })
+      if (j) Object.assign(j, { phase: "applied", resultBranch: result.branch, lastStatus: describeOutcome(outcome, result), updatedAt: Date.now(), remote: undefined })
     })
     if (job.snapshotRef) await deleteRef(job.repoTop, job.snapshotRef)
 

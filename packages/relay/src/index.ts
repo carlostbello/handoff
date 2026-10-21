@@ -1,5 +1,5 @@
 import type { CompleteUploadRequest, JobStatus, PairRequest, PostEventRequest } from "@handoff/shared"
-import { Hub, HttpError, type Env, type Principal } from "./hub.js"
+import { Hub, HttpError, timingSafeEqual, type Env, type Principal } from "./hub.js"
 
 export { Hub }
 
@@ -97,7 +97,14 @@ async function route(request: Request, env: Env): Promise<Response> {
 
   // ----- authenticated -----
   const token = request.headers.get("authorization")?.replace(/^Bearer\s+/i, "") ?? ""
-  const principal = await hub.authenticate(token)
+  // A client's poll authenticates and reads in one Durable Object request.
+  if (method === "GET" && path === "/v1/sync") {
+    const res = await hub.deviceSync(token, Number(url.searchParams.get("after") ?? 0))
+    if (!res) throw new HttpError(401, "unauthorized")
+    return json(res)
+  }
+  // The host token is a Worker secret: check it here instead of asking the Durable Object.
+  const principal: Principal | null = env.HOST_TOKEN && token && timingSafeEqual(token, env.HOST_TOKEN) ? { role: "host" } : await hub.authenticate(token)
   if (!principal) throw new HttpError(401, "unauthorized")
 
   let m: RegExpMatchArray | null
@@ -171,6 +178,7 @@ async function route(request: Request, env: Env): Promise<Response> {
   if ((m = path.match(/^\/v1\/host\/jobs\/([^/]+)\/result\/complete$/)) && method === "POST") {
     return completeUpload(env, hub, principal, m[1]!, "result", request)
   }
+  if (method === "GET" && path === "/v1/host/sync") return json(await hub.hostSync(Number(url.searchParams.get("after") ?? 0)))
   if (method === "GET" && path === "/v1/host/events") {
     return json(await hub.events(principal, Number(url.searchParams.get("after") ?? 0)))
   }

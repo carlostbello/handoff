@@ -39,6 +39,9 @@ const TICKET_TTL_MS = 60 * 1000
 const MAX_PAIR_FAILURES_PER_IP_HOUR = 10
 const MAX_PAIR_FAILURES_PER_HOUR = 100
 const RETENTION_MS = 30 * 24 * 60 * 60 * 1000
+const LAST_SEEN_RESOLUTION_MS = 5 * 60 * 1000
+/** Jobs a poller still has to act on: anything not acknowledged, cancelled or failed. */
+const OPEN_STATUSES: readonly JobStatus[] = ["uploading", "queued", "claimed", "running", "needs_input", "done"]
 const CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 
 type BlobKind = "request" | "result"
@@ -49,7 +52,7 @@ const HOST_TRANSITIONS: Partial<Record<JobStatus, readonly JobStatus[]>> = {
   needs_input: ["running", "failed", "cancelled"],
 }
 
-function timingSafeEqual(a: string, b: string): boolean {
+export function timingSafeEqual(a: string, b: string): boolean {
   if (a.length !== b.length) return false
   let diff = 0
   for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i)
@@ -97,7 +100,9 @@ export class Hub extends DurableObject<Env> {
       .exec<{ id: string }>("SELECT id FROM devices WHERE token_hash = ? AND revoked_at IS NULL", hash)
       .toArray()[0]
     if (!row) return null
-    this.sql.exec("UPDATE devices SET last_seen_at = ? WHERE id = ?", Date.now(), row.id)
+    // Polling clients authenticate every minute or so; record last-seen at most every few minutes.
+    const now = Date.now()
+    this.sql.exec("UPDATE devices SET last_seen_at = ? WHERE id = ? AND (last_seen_at IS NULL OR last_seen_at < ?)", now, row.id, now - LAST_SEEN_RESOLUTION_MS)
     return { role: "device", deviceId: row.id }
   }
 
@@ -229,6 +234,29 @@ export class Hub extends DurableObject<Env> {
       throw new HttpError(404, "job not found")
     }
     return job
+  }
+
+  /**
+   * One round trip for a polling client: authenticate, new events, and its open jobs.
+   * Returns null for a bad token. Each separate call would be its own Durable Object request.
+   */
+  async deviceSync(token: string, after: number): Promise<{ events: RelayEvent[]; cursor: number; jobs: JobRecord[] } | null> {
+    const principal = await this.authenticate(token)
+    if (principal?.role !== "device") return null
+    return { ...this.events(principal, after), jobs: this.openJobs(principal.deviceId) }
+  }
+
+  /** One round trip for the host daemon: new device events and queued jobs. */
+  hostSync(after: number): { events: RelayEvent[]; cursor: number; queued: JobRecord[] } {
+    return { ...this.events({ role: "host" }, after), queued: this.listJobs({ role: "host" }, "queued") }
+  }
+
+  private openJobs(deviceId: string): JobRecord[] {
+    const marks = OPEN_STATUSES.map(() => "?").join(", ")
+    const ids = this.sql
+      .exec<{ id: string }>(`SELECT id FROM jobs WHERE device_id = ? AND status IN (${marks}) ORDER BY created_at DESC LIMIT 200`, deviceId, ...OPEN_STATUSES)
+      .toArray()
+    return ids.map((r) => this.public(this.row(r.id)!))
   }
 
   listJobs(principal: Principal, status?: JobStatus): JobRecord[] {

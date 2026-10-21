@@ -42,11 +42,17 @@ export function createFakeT3(worktreesDir: string, hooks: FakeHooks = {}) {
   const launches: FakeLaunch[] = []
   const subagents = new Map<string, number>()
   const leadRunning = new Map<string, number>()
+  const busyThreads = new Set<string>()
   const t3 = {
     launches,
     sends,
     hooks,
     projects,
+    /** Mark a thread as working (e.g. the user replied in T3 and the agent is busy). */
+    setBusy(threadId: string, busy: boolean) {
+      if (busy) busyThreads.add(threadId)
+      else busyThreads.delete(threadId)
+    },
     /** Simulate the user replying to the agent in T3 itself: a new run, optionally with a commit. */
     simulateReply(threadId: string, opts: { commit?: string; text?: string; asked?: string } = {}) {
       const t = threads.get(threadId)!
@@ -114,7 +120,7 @@ export function createFakeT3(worktreesDir: string, hooks: FakeHooks = {}) {
     },
     async thread(threadId: string) {
       const t = threads.get(threadId)!
-      return { threadId, projectId: t.projectId, title: t.title, status: "completed", branch: t.branch, worktreePath: t.worktree, pendingRequestCount: 0, latestRunId: `r${t.run}` }
+      return { threadId, projectId: t.projectId, title: t.title, status: busyThreads.has(threadId) ? "running" : "completed", branch: t.branch, worktreePath: t.worktree, pendingRequestCount: 0, latestRunId: `r${t.run}` }
     },
     async finalRunStatus(threadId: string) {
       const left = leadRunning.get(threadId)

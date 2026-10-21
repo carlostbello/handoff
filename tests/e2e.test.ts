@@ -442,6 +442,26 @@ describe.skipIf(!url)("handoff end to end", () => {
     expect(posted.at(-1)!.text).toContain("Second tweak done.")
     expect(sh(work, "log", "-1", "--format=%s")).toBe("Agent: second tweak")
 
+    // While T3 works in the thread again, the client is told so (for its status display), and told when it stops.
+    const remoteOf = () => {
+      const st = JSON.parse(readFileSync(statePath, "utf8"))
+      const newest = (Object.values(st.jobs) as Array<{ sessionID: string; createdAt: number; remote?: { active: boolean; note: string } }>)
+        .filter((j) => j.sessionID === "ses_conv")
+        .sort((a, b) => b.createdAt - a.createdAt)[0]!
+      return newest.remote
+    }
+    fake.setBusy(threadId, true)
+    await runner.pollConversations()
+    await engine.pollOnce()
+    expect(remoteOf()).toMatchObject({ active: true, note: "T3 is working in the thread" })
+    const before = posted.length
+    await runner.pollConversations() // no change, no new event
+    fake.setBusy(threadId, false)
+    await runner.pollConversations()
+    await engine.pollOnce()
+    expect(remoteOf()).toMatchObject({ active: false })
+    expect(posted.length).toBe(before) // activity only updates the status display, it doesn't post to the session
+
     // A new run with nothing new in it (e.g. a wake-up T3 cancelled before it started) sends nothing.
     const count = posted.length
     fake.simulateReply(threadId)

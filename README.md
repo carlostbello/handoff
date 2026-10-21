@@ -172,6 +172,14 @@ The host refuses jobs from any client you haven't confirmed. Pair as many client
 /handoff help
 ```
 
+In the opencode TUI you can also see progress without asking:
+
+- **Footer:** while the open session has a handoff in progress, the prompt footer shows a short line, such as `⇄ handoff mawvxy running 12m`. It also shows `T3 working` when the T3 thread is busy again after a result arrived, for example because you replied in T3 or a subagent is still finishing.
+- **Sidebar:** a Handoff section lists the session's recent handoffs, with the host's latest progress note for running ones.
+- **`/handoffs` or "Handoff: status" in the command palette:** every recent handoff across sessions, newest and running ones first. Picking one opens its session.
+
+The TUI reads this from the plugin's local state file, so it adds no relay traffic.
+
 On the host: `handoff-daemon status | config | models | devices | revoke <deviceId> | pair | run | install | uninstall`.
 
 ## Choosing models
@@ -260,6 +268,16 @@ Client settings live in `~/.config/handoff/client.json`, and pairing details in 
 - **T3 access.** Only the daemon talks to T3's local MCP endpoint, using a token you approve in the browser.
 - **The agent.** It's told never to push or fetch. Credentials embedded in remote URLs are stripped before sending.
 - **Code you're allowed to move.** handoff copies repositories from the client to the host, encrypted in transit and at rest in the relay. Only use it with code you're permitted to copy to that host, and check your organization's policies before using it with work repositories.
+
+### Free-tier usage
+
+The relay is designed to stay well inside Cloudflare's Workers Free limits (100,000 Worker requests, 100,000 Durable Object requests and 5 million SQLite rows read per day):
+
+- **The host daemon** relies on a WebSocket for new jobs and client events. It polls the relay only every 5 minutes as a safety net, or every 30 seconds while the socket is down.
+- **Each client** sends one request per poll: every 15 seconds while a handoff is running, every minute for a day after a result arrives (to catch replies made in T3), and every 5 minutes otherwise.
+- **Each poll is one Durable Object request**, including authentication.
+
+Expect a few thousand requests a day per active client.
 
 ### Cloudflare account safety
 

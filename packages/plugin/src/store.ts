@@ -70,7 +70,11 @@ export interface DeviceJob {
   /** "host": an update the host sent from the conversation's T3 thread, not a handoff from here. */
   origin?: "handoff" | "host"
   createdAt: number
+  /** When anything about this job last changed (for status displays). */
+  updatedAt?: number
   lastStatus?: string
+  /** After delivery: the host reported the T3 thread working again, or stopping. */
+  remote?: { active: boolean; note: string; since: number }
   threadId?: string
   resultBranch?: string
   /** Set when this job replaced one that failed with needs_full_bundle. */
@@ -128,7 +132,7 @@ export async function updateJob(id: string, patch: Partial<DeviceJob>): Promise<
   return mutateState((s) => {
     const job = s.jobs[id]
     if (!job) return undefined
-    Object.assign(job, patch)
+    Object.assign(job, patch, { updatedAt: Date.now() })
     return { ...job }
   })
 }

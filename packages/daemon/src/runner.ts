@@ -101,6 +101,8 @@ interface Conversation {
   lastJobId: string
   /** A handoff job currently working in the thread. */
   activeJobId?: string
+  /** Last activity reported to the client: the thread is working after a delivery. */
+  remoteBusy?: boolean
   updatedAt: number
 }
 
@@ -120,6 +122,8 @@ interface State {
 const EMPTY_STATE = (): State => ({ eventCursor: 0, jobs: {}, conversations: {}, repos: {} })
 /** Stop watching a conversation's thread after this long without activity. */
 const CONVERSATION_TTL_MS = 14 * 24 * 60 * 60 * 1000
+/** With the relay socket connected, poll the relay this often anyway in case a notification was lost. */
+const RELAY_SAFETY_POLL_MS = 5 * 60 * 1000
 
 const log = (...args: unknown[]) => console.log(new Date().toISOString(), ...args)
 
@@ -130,6 +134,13 @@ export class Runner {
   private t3: T3Like
   private stopping = false
   private wake: (() => void) | null = null
+  private socketOpen = false
+  private syncRequested = false
+
+  private requestSync(): void {
+    this.syncRequested = true
+    this.wake?.()
+  }
   private replies = new Map<string, ReplyPayload[]>()
   /** How long a thread must stay idle, with no subagents working, before its result is collected. */
   settleMs = 20_000
@@ -150,12 +161,10 @@ export class Runner {
   /** One full pass (events, queue, and every job it starts). Used by tests and `status`. */
   async runOnce(): Promise<void> {
     this.state = { ...EMPTY_STATE(), ...(await readJson<State>(STATE_PATH)) }
-    await this.pollEvents()
     for (;;) {
-      const claimed = await this.pollQueue()
+      const claimed = await this.syncRelay()
       while (this.active.size) await Promise.all([...this.active.values()])
       if (!claimed) break
-      await this.pollEvents()
     }
     await this.pollConversations()
   }
@@ -181,10 +190,16 @@ export class Runner {
       if (job.phase === "claimed" || job.phase === "launched" || job.phase === "collecting") this.spawn(job.id)
     }
 
+    let lastSync = 0
     while (!this.stopping) {
       try {
-        await this.pollEvents()
-        await this.pollQueue()
+        // The socket says when a job is queued or a client posts an event, so the relay is only
+        // polled then, or every few minutes as a safety net (or every loop while the socket is down).
+        if (this.syncRequested || !this.socketOpen || Date.now() - lastSync >= RELAY_SAFETY_POLL_MS) {
+          this.syncRequested = false
+          lastSync = Date.now()
+          await this.syncRelay()
+        }
         await this.pollConversations()
       } catch (err) {
         log("poll error:", (err as Error).message)
@@ -217,12 +232,16 @@ export class Runner {
         let ping: ReturnType<typeof setInterval> | undefined
         ws.onopen = () => {
           retry = 1000
+          this.socketOpen = true
+          // Anything announced while disconnected was missed: catch up now.
+          this.requestSync()
           ping = setInterval(() => ws.readyState === WebSocket.OPEN && ws.send("ping"), 30_000)
         }
         ws.onmessage = (m) => {
-          if (String(m.data).includes('"job"') || String(m.data).includes('"event"')) this.wake?.()
+          if (String(m.data).includes('"job"') || String(m.data).includes('"event"')) this.requestSync()
         }
         ws.onclose = () => {
+          this.socketOpen = false
           clearInterval(ping)
           if (!this.stopping) setTimeout(connect, (retry = Math.min(retry * 2, 60_000)))
         }
@@ -245,10 +264,20 @@ export class Runner {
   }
 
   /** Claims queued jobs up to the concurrency limit. Returns how many were claimed. */
-  private async pollQueue(): Promise<number> {
+  /** New client events, then claim queued jobs up to the concurrency limit. One relay request per page. */
+  private async syncRelay(): Promise<number> {
     await this.reloadSettings()
+    let queued: JobRecord[] = []
+    for (;;) {
+      const page = await this.relay.sync(this.state.eventCursor)
+      queued = page.queued
+      for (const ev of page.events) await this.handleEvent(ev)
+      if (page.cursor === this.state.eventCursor) break
+      this.state.eventCursor = page.cursor
+      await this.save()
+      if (page.events.length < 200) break
+    }
     let claimedCount = 0
-    const queued = await this.relay.jobs("queued")
     for (const job of queued.reverse()) {
       if (this.active.size >= this.config.concurrency) break
       if (this.state.jobs[job.id]) continue
@@ -259,17 +288,6 @@ export class Runner {
       claimedCount++
     }
     return claimedCount
-  }
-
-  private async pollEvents(): Promise<void> {
-    for (;;) {
-      const { events, cursor } = await this.relay.events(this.state.eventCursor)
-      for (const ev of events) await this.handleEvent(ev)
-      if (cursor === this.state.eventCursor) break
-      this.state.eventCursor = cursor
-      await this.save()
-      if (events.length < 200) break
-    }
   }
 
   private async handleEvent(ev: RelayEvent): Promise<void> {
@@ -317,7 +335,8 @@ export class Runner {
       .catch((err) => log(`job ${jobId} crashed:`, err))
       .finally(() => {
         this.active.delete(jobId)
-        this.wake?.()
+        // A slot is free: claim anything that queued up meanwhile.
+        this.requestSync()
       })
     this.active.set(jobId, run)
   }
@@ -741,6 +760,7 @@ export class Runner {
         lastSummaryHash: await sha256Hex(utf8(summary)),
         lastJobId: job.id,
         activeJobId: undefined,
+        remoteBusy: false,
         updatedAt: Date.now(),
       })
       await this.save()
@@ -773,9 +793,11 @@ export class Runner {
           continue
         }
         const thread = await this.t3.thread(conversation.threadId).catch(() => null)
-        if (!thread?.latestRunId || thread.latestRunId === conversation.lastRunId) continue
-        if (ACTIVE_STATUSES.includes(thread.status)) continue
-        if ((await this.t3.activeSubagents(conversation.projectId, conversation.threadId)).length) continue
+        if (!thread) continue
+        const subagents = ACTIVE_STATUSES.includes(thread.status) ? [] : await this.t3.activeSubagents(conversation.projectId, conversation.threadId)
+        const busy = ACTIVE_STATUSES.includes(thread.status) || subagents.length > 0
+        await this.signalActivity(conversation, busy, subagents.map((s) => s.title))
+        if (!thread.latestRunId || thread.latestRunId === conversation.lastRunId || busy) continue
         // Same settling rule as handoff jobs: a subagent's report can start another run shortly after.
         const seen = this.settling.get(key)
         if (!seen || seen.runId !== thread.latestRunId) {
@@ -792,6 +814,28 @@ export class Runner {
   }
 
   private settling = new Map<string, { runId: string; since: number }>()
+
+  /**
+   * Tell the client when a thread it already has results from starts or stops working again
+   * (the user replied in T3, or a subagent is still finishing). One event per change.
+   */
+  private async signalActivity(conversation: Conversation, busy: boolean, subagents: string[]): Promise<void> {
+    if (busy === (conversation.remoteBusy ?? false)) return
+    conversation.remoteBusy = busy
+    await this.save()
+    const message = busy
+      ? subagents.length
+        ? `T3 is still working: ${subagents.sort().join(", ")}`
+        : "T3 is working in the thread"
+      : "T3 stopped working"
+    try {
+      const payload: StatusPayload = { message, threadId: conversation.threadId, activity: busy ? "busy" : "idle" }
+      const sealed = await sealJson(payload, await this.deviceKey(conversation.deviceId), this.config.keys, sealContext.event("status", conversation.lastJobId))
+      await this.relay.postEvent(conversation.lastJobId, "status", sealed)
+    } catch (err) {
+      log(`conversation ${conversation.threadId}: could not send activity:`, (err as Error).message)
+    }
+  }
 
   private async pushUpdate(conversation: Conversation, thread: { worktreePath: string | null; latestRunId: string | null }): Promise<void> {
     const { repoDir, branch } = conversation

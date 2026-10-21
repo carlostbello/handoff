@@ -38,6 +38,8 @@ export interface RelayClientOptions {
 }
 
 const DEFAULT_TIMEOUT_MS = 120_000
+/** Jobs a client still has to act on (matches the relay's /v1/sync). */
+const OPEN_STATUSES: readonly JobStatus[] = ["uploading", "queued", "claimed", "running", "needs_input", "done"]
 /** Blob parts and downloads are larger; allow for slow links. */
 const BLOB_TIMEOUT_MS = 15 * 60_000
 
@@ -146,6 +148,25 @@ export class DeviceClient extends BaseClient {
     return this.json("GET", `/v1/events?after=${after}`)
   }
 
+  private syncSupported = true
+
+  /**
+   * New events plus this device's open jobs, in one request. Falls back to separate calls
+   * against a relay that predates /v1/sync.
+   */
+  async sync(after: number): Promise<EventsResponse & { jobs: JobRecord[] }> {
+    if (this.syncSupported) {
+      try {
+        return await this.json("GET", `/v1/sync?after=${after}`)
+      } catch (err) {
+        if (!(err instanceof RelayError && err.status === 404)) throw err
+        this.syncSupported = false
+      }
+    }
+    const [events, jobs] = await Promise.all([this.events(after), this.listJobs()])
+    return { ...events, jobs: jobs.filter((j) => OPEN_STATUSES.includes(j.status)) }
+  }
+
   async postEvent(jobId: string, kind: EventKind, payload: string): Promise<void> {
     await this.request("POST", "/v1/events", { jobId, kind, payload })
   }
@@ -203,6 +224,22 @@ export class HostClient extends BaseClient {
 
   async events(after: number): Promise<EventsResponse> {
     return this.json("GET", `/v1/host/events?after=${after}`)
+  }
+
+  private syncSupported = true
+
+  /** New device events plus queued jobs, in one request (separate calls on an older relay). */
+  async sync(after: number): Promise<EventsResponse & { queued: JobRecord[] }> {
+    if (this.syncSupported) {
+      try {
+        return await this.json("GET", `/v1/host/sync?after=${after}`)
+      } catch (err) {
+        if (!(err instanceof RelayError && err.status === 404)) throw err
+        this.syncSupported = false
+      }
+    }
+    const [events, queued] = await Promise.all([this.events(after), this.jobs("queued")])
+    return { ...events, queued }
   }
 
   async postEvent(jobId: string, kind: EventKind, payload: string): Promise<void> {

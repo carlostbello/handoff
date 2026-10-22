@@ -53,6 +53,8 @@ import {
 } from "./store.js"
 
 export interface Opencode {
+  /** Name of the app the user talks to, for messages (default "opencode"). */
+  readonly app?: string
   /** Working directory of a session. */
   sessionDirectory(sessionID: string): Promise<string>
   sessionTitle(sessionID: string): Promise<string | null>
@@ -247,7 +249,7 @@ export class Engine {
         const text = await withTimeout(this.opencode.generate(sessionID, briefPrompt(instructions, repoName)), BRIEF_TIMEOUT_MS)
         const brief = parseBrief(text)
         if (brief) return brief
-        this.opencode.log(`handoff: the model's brief wasn't usable (attempt ${attempt})`)
+        this.opencode.log(`handoff: the model's brief wasn't usable (attempt ${attempt}): ${JSON.stringify(text.slice(0, 300))}`)
       } catch (err) {
         this.opencode.log(`handoff: couldn't write a brief (attempt ${attempt}): ${(err as Error).message}`)
       }
@@ -549,7 +551,7 @@ export class Engine {
     if (job.snapshotRef) await deleteRef(job.repoTop, job.snapshotRef)
 
     const { resume } = await loadSettings()
-    await this.postToSession(job, resultMessage(job, result, outcome, resume), resume)
+    await this.postToSession(job, resultMessage(job, result, outcome, resume, this.opencode.app ?? "opencode"), resume)
     await relay.ack(jobId).catch((err) => this.opencode.log(`handoff: ack failed: ${(err as Error).message}`))
   }
 
@@ -695,7 +697,7 @@ function describeOutcome(outcome: ApplyOutcome, result: ResultManifest): string 
   }
 }
 
-function resultMessage(job: DeviceJob, result: ResultManifest, outcome: ApplyOutcome, resume: boolean): string {
+function resultMessage(job: DeviceJob, result: ResultManifest, outcome: ApplyOutcome, resume: boolean, app: string): string {
   const commits = result.commits.map((c) => `- \`${c.sha.slice(0, 8)}\` ${c.subject}`).join("\n")
   let applied: string
   switch (outcome.kind) {
@@ -717,7 +719,7 @@ function resultMessage(job: DeviceJob, result: ResultManifest, outcome: ApplyOut
       ? `## Update from T3 (\`${short(job.id)}\`)`
       : `## Handoff \`${short(job.id)}\` ${result.outcome === "succeeded" ? "finished" : "ended without success"}`,
     update
-      ? `The conversation from this session continued on the host in T3 thread "${result.t3.threadTitle}".${result.request ? ` The message sent to the agent in T3:\n\n> ${result.request.replace(/\n/g, "\n> ")}\n\n` : " "}Reply here with \`/handoff <message>\` to continue it from opencode.`
+      ? `The conversation from this session continued on the host in T3 thread "${result.t3.threadTitle}".${result.request ? ` The message sent to the agent in T3:\n\n> ${result.request.replace(/\n/g, "\n> ")}\n\n` : " "}Reply here with \`/handoff <message>\` to continue it from ${app}.`
       : `You handed this off from this session${job.instructions ? ` with the instructions: "${job.instructions.split("\n")[0]!.slice(0, 300)}"` : " to continue the work in progress"}. It ran on the host in T3 thread "${result.t3.threadTitle}". Follow up with \`/handoff <message>\` here, or directly in that thread in T3.`,
     applied,
     commits ? `### Commits\n${commits}` : "",

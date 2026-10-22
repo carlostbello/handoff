@@ -4,5 +4,5 @@ import { writeFileSync } from "node:fs"
 
 writeFileSync(
   new URL("../dist/handoff/package.json", import.meta.url),
-  JSON.stringify({ name: "opencode-handoff", version: "0.4.0", type: "module", exports: { ".": "./server.js", "./tui": "./tui.jsx" } }, null, 2) + "\n",
+  JSON.stringify({ name: "opencode-handoff", version: "0.5.0", type: "module", exports: { ".": "./server.js", "./tui": "./tui.jsx" } }, null, 2) + "\n",
 )

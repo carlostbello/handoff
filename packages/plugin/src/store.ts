@@ -7,13 +7,28 @@ import { homedir } from "node:os"
 import { dirname, join } from "node:path"
 import type { HandoffBrief, KeyPair } from "@handoff/shared"
 
-const CONFIG_DIR = process.env.HANDOFF_CONFIG_DIR ?? join(homedir(), ".config", "handoff")
-const STATE_DIR = process.env.HANDOFF_STATE_DIR ?? join(homedir(), ".local", "state", "handoff")
-export const DEVICE_CONFIG = join(CONFIG_DIR, "device.json")
-export const CLIENT_SETTINGS = join(CONFIG_DIR, "client.json")
-export const DEVICE_STATE = join(STATE_DIR, "device-state.json")
-export const WORK_DIR = join(STATE_DIR, "work")
-const LOCK = join(STATE_DIR, "poller.lock")
+const BASE_CONFIG_DIR = process.env.HANDOFF_CONFIG_DIR ?? join(homedir(), ".config", "handoff")
+const BASE_STATE_DIR = process.env.HANDOFF_STATE_DIR ?? join(homedir(), ".local", "state", "handoff")
+let STATE_DIR = BASE_STATE_DIR
+export let DEVICE_CONFIG = join(BASE_CONFIG_DIR, "device.json")
+export let CLIENT_SETTINGS = join(BASE_CONFIG_DIR, "client.json")
+export let DEVICE_STATE = join(BASE_STATE_DIR, "device-state.json")
+export let WORK_DIR = join(BASE_STATE_DIR, "work")
+let LOCK = join(BASE_STATE_DIR, "poller.lock")
+
+/**
+ * Keep a client's pairing, settings and jobs in their own subfolder (e.g. `kilo`), so it is a
+ * separate device to the host and never picks up another client's results. Call before any other use.
+ */
+export function useNamespace(name: string): void {
+  const config = join(BASE_CONFIG_DIR, name)
+  STATE_DIR = join(BASE_STATE_DIR, name)
+  DEVICE_CONFIG = join(config, "device.json")
+  CLIENT_SETTINGS = join(config, "client.json")
+  DEVICE_STATE = join(STATE_DIR, "device-state.json")
+  WORK_DIR = join(STATE_DIR, "work")
+  LOCK = join(STATE_DIR, "poller.lock")
+}
 
 export interface DeviceConfig {
   relayUrl: string

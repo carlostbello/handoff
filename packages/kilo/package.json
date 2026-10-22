@@ -1,0 +1,17 @@
+{
+  "name": "@handoff/kilo-plugin",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "esbuild src/index.ts --bundle --platform=node --format=esm --target=es2023 --outfile=dist/handoff.js",
+    "typecheck": "tsc -p ."
+  },
+  "dependencies": {
+    "@handoff/opencode-plugin": "*",
+    "@handoff/shared": "*"
+  },
+  "devDependencies": {
+    "@kilocode/sdk": "7.8.15"
+  }
+}

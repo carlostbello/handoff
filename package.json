@@ -6,10 +6,11 @@
     "packages/*"
   ],
   "scripts": {
-    "typecheck": "for p in shared relay daemon plugin; do tsc -p packages/$p || exit 1; done",
+    "typecheck": "for p in shared relay daemon plugin kilo; do tsc -p packages/$p || exit 1; done",
     "test": "vitest run",
-    "build": "npm run build -w @handoff/daemon && npm run build -w @handoff/opencode-plugin",
-    "package:plugin": "npm run build -w @handoff/opencode-plugin && mkdir -p dist && tar -C packages/plugin/dist/handoff -czf dist/handoff-plugin.tar.gz ."
+    "build": "npm run build -w @handoff/daemon && npm run build -w @handoff/opencode-plugin && npm run build -w @handoff/kilo-plugin",
+    "package:plugin": "npm run build -w @handoff/opencode-plugin && mkdir -p dist && tar -C packages/plugin/dist/handoff -czf dist/handoff-plugin.tar.gz .",
+    "package:kilo": "npm run build -w @handoff/kilo-plugin && mkdir -p dist && cp packages/kilo/dist/handoff.js dist/handoff-kilo.js"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

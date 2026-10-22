@@ -77,7 +77,7 @@ If you didn't take the previous result (for example, it stayed on its own branch
 ## Requirements
 
 - **Host:** T3 Code, git, and Node 24. `handoff-daemon install` sets up a macOS LaunchAgent. On other systems, run `handoff-daemon run` under your service manager.
-- **Client:** opencode 2.0.x and git. No Node, npm or Docker: opencode runs the plugin in its own built-in runtime, and installing it only takes `curl` and `tar`. You can also download `handoff-plugin.tar.gz` from the release page and unpack it with `tar -xzf`.
+- **Client:** opencode 2.0.x, or Kilo 7.8.x (VS Code extension or CLI), and git. No Node, npm or Docker: opencode runs the plugin in its own built-in runtime, and installing it only takes `curl` and `tar`. You can also download `handoff-plugin.tar.gz` from the release page and unpack it with `tar -xzf`.
 - **Relay:** a free Cloudflare account. R2 is free up to 10 GB, but Cloudflare asks for a payment method on file to enable it. See [Cloudflare account safety](#cloudflare-account-safety).
 
 ## Setup
@@ -145,12 +145,33 @@ curl -fsSL https://github.com/carlostbello/handoff/releases/latest/download/hand
 - Alternatively, run `npm run build` and copy `packages/plugin/dist/handoff/` yourself.
 - Afterwards, restart opencode (`opencode service restart`).
 
+### 3a. Kilo client (instead of, or as well as, opencode)
+
+Kilo, including its VS Code extension, uses a single plugin file, `handoff-kilo.js`, also attached to each release:
+
+```sh
+mkdir -p ~/.config/kilo/plugins
+curl -fsSL -o ~/.config/kilo/plugins/handoff.js https://github.com/carlostbello/handoff/releases/latest/download/handoff-kilo.js
+```
+
+- To enable it for one repository only, put the file in that repository's `.kilo/plugins/` folder instead.
+- Alternatively, run `npm run package:kilo` and copy `dist/handoff-kilo.js` yourself.
+- Afterwards, reload VS Code (**Developer: Reload Window**) or restart the Kilo CLI.
+
+`/handoff` then appears in the slash menu of Kilo's chat panel, and everything under [Usage](#usage) works the same, with these differences:
+
+- **Pair it separately.** The Kilo client is its own client to the host, with its own pairing, settings and jobs under `~/.config/handoff/kilo/` and `~/.local/state/handoff/kilo/`. It never picks up results meant for opencode on the same machine, and the other way round.
+- **Output appears in the chat.** A command's output is shown as its own message, labelled "Sent by Kilo · /handoff …". That message is kept out of the model's context, but Kilo still runs one short model turn after each `/handoff`, which the agent uses to acknowledge it.
+- **Results** arrive as a "Sent by Kilo · Handoff … finished" message. With `resume` on (the default), the agent then takes a turn on it, and Kilo's usual "done" notification fires.
+- **No live status.** Kilo's panel has no place for the status line, sidebar or toasts. Use `/handoff status`.
+- **Results arrive while Kilo is running:** any VS Code window with Kilo open, or the Kilo CLI. Until then they wait in the relay.
+
 ### 4. Pair
 
 With both machines in front of you:
 
 1. On the host, run `handoff-daemon pair`. It prints a command, and the code in it expires in 10 minutes.
-2. In opencode on the client, run that command:
+2. In opencode (or Kilo) on the client, run that command:
    ```
    /handoff pair https://handoff-relay.<subdomain>.workers.dev XXXX-XXXX XXXX-XXXX-XXXX-XXXX
    ```
@@ -295,6 +316,8 @@ npm test                                                    # unit tests; live t
 cd packages/relay && echo 'HOST_TOKEN=dev-host-token-0123456789' > .dev.vars && npx wrangler dev --port 8787
 RELAY_URL=http://localhost:8787 HOST_TOKEN=dev-host-token-0123456789 npm test   # + relay smoke + end-to-end
 npm run package:plugin                                      # dist/handoff-plugin.tar.gz for a release
+npm run package:kilo                                        # dist/handoff-kilo.js for a release
+KILO_BIN=$(which kilo) KILO_MODEL=kilo/kilo-auto/free RELAY_URL=... HOST_TOKEN=... npx vitest run tests/kilo-live  # the Kilo client in a real `kilo serve`, with a free model
 ```
 
 | Package | What it is |
@@ -303,6 +326,7 @@ npm run package:plugin                                      # dist/handoff-plugi
 | `packages/relay` | Cloudflare Worker + SQLite Durable Object + R2 |
 | `packages/daemon` | `handoff-daemon`, the host runner. Drives T3 through its MCP endpoint. |
 | `packages/plugin` | opencode v2 plugin: `server.js` (the `/handoff` command and poller) and `tui.js` (toasts and notifications) |
+| `packages/kilo` | Kilo plugin (opencode v1 API), one file: `handoff.js`. Shares the engine with `packages/plugin`. |
 
 The end-to-end test runs the real plugin engine, relay and daemon runner, with a fake T3 agent (`tests/support/fake-t3.ts`). It covers:
 
@@ -321,3 +345,4 @@ The end-to-end test runs the real plugin engine, relay and daemon runner, with a
 - Model names in requests are matched by simple rules, not by an LLM. When it matters, check the toast or use `--model`.
 - Short `/handoff` notices (status, pairing, "handed off", the model choice) are TUI toasts. Without the TUI plugin, for example a headless `opencode serve`, they stay queued in the session, and the agent gets each one as a separate turn before the result.
 - opencode's v2 plugin and session APIs are beta; this targets opencode 2.0.x.
+- Kilo plugins can't run a command without a model turn, so each `/handoff` in Kilo costs one short turn. Kilo writes the brief in a temporary child session, with every tool denied.

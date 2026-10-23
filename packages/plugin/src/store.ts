@@ -5,7 +5,7 @@
 import { mkdir, readFile, rename, writeFile, rm, open as openFile } from "node:fs/promises"
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
-import type { HandoffBrief, KeyPair } from "@handoff/shared"
+import type { HandoffBrief, InputSpec, KeyPair, RefusedInput } from "@handoff/shared"
 
 const BASE_CONFIG_DIR = process.env.HANDOFF_CONFIG_DIR ?? join(homedir(), ".config", "handoff")
 const BASE_STATE_DIR = process.env.HANDOFF_STATE_DIR ?? join(homedir(), ".local", "state", "handoff")
@@ -52,9 +52,11 @@ export interface ClientSettings {
   transcriptChars: number
   /** Have this session's model write a task brief for the host agent before handing off. */
   brief: boolean
+  /** How many times in a row the local agent may follow up a blocked handoff on its own. */
+  autoFollowUps: number
 }
 
-export const DEFAULT_SETTINGS: ClientSettings = { apply: "auto", resume: true, transcriptChars: 120_000, brief: true }
+export const DEFAULT_SETTINGS: ClientSettings = { apply: "auto", resume: true, transcriptChars: 120_000, brief: true, autoFollowUps: 2 }
 
 export type DeviceJobPhase =
   | "packing"
@@ -96,12 +98,43 @@ export interface DeviceJob {
   retryOf?: string
   /** Open question from the host agent. */
   question?: { requestId: string; question: unknown }
+  /** Extra material asked for with the handoff (brief or the agent's `handoff` call). */
+  inputs?: InputSpec[]
+  /** What went with the handoff beyond the snapshot, for status and the agent. */
+  sent?: { inputs: string[]; refused: RefusedInput[]; skipped: string[] }
+  /** Material for the host agent: requested by it, or sent from here while it works. */
+  inputRequests?: InputRequest[]
+  /** Result outcome, once applied. */
+  outcome?: "succeeded" | "failed" | "blocked"
+}
+
+export interface InputRequest {
+  /** Our id for `/handoff approve`. */
+  id: string
+  /** The host agent's request id, when it asked. */
+  requestId?: string
+  inputs: InputSpec[]
+  /** The agent's note (from the host) or a message for it (from here). */
+  note?: string
+  message?: string
+  /** "failed": couldn't reach the relay (retried). "rejected": the host couldn't use it. */
+  state: "awaiting-approval" | "sending" | "sent" | "received" | "failed" | "rejected"
+  /** Approved by the user, for retries. */
+  approved?: boolean
+  refuseReason?: string
+  deliveryJobId?: string
+  detail?: string
+  createdAt: number
 }
 
 export interface DeviceState {
   eventCursor: number
   jobs: Record<string, DeviceJob>
   repos: Record<string, { id: string; knownCommit: string | null }>
+  /** Delivery jobs (inputs sent to a running handoff) -> the handoff they belong to. */
+  deliveries?: Record<string, string>
+  /** Per session: blocked results in a row, which bounds automatic follow-ups. */
+  blockedRounds?: Record<string, number>
 }
 
 async function readJson<T>(path: string): Promise<T | undefined> {

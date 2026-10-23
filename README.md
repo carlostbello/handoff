@@ -63,6 +63,34 @@ Each opencode session gets one T3 thread, and you can keep talking to it from ei
 
 If you didn't take the previous result (for example, it stayed on its own branch), the next handoff starts a fresh thread.
 
+### Agents drive it too
+
+You don't have to type `/handoff`. The plugin gives opencode's agent three tools:
+- `handoff` starts a handoff, or follows up on one, with a brief the agent writes.
+- `handoff_send` gives a running handoff more material or a message.
+- `handoff_status` checks on handoffs.
+
+So you can say:
+
+```
+research how the recorder handles silence, add what the host needs, then hand off with opus and have Luna review
+```
+
+The agent does the research and writes the brief. It sends whatever the work depends on beyond your checkout: other branches or commits, or files from other repositories. Then it hands off. Model names in your words pick the host's models, just as with `/handoff`.
+
+**When the host agent is missing something.** The host gets your current branch and its history, but not other branches, and it can't fetch from remotes. When the host agent needs more, it asks your machine for it and waits:
+
+- **This repository**, including its other worktrees: sent automatically. That covers another branch, a commit, or the current files.
+- **Anything else** (another repository or a folder): waits for you. Run `/handoff approve <id>` or `/handoff deny <id> [reason]`.
+- **Things your machine can't send as asked**, such as a branch that only exists on a remote: your opencode agent gets a turn to fix it. For example, it runs `git fetch`, then sends the material with `handoff_send`. The host agent then continues in the same thread.
+- **Files that look like secrets** (`.env` files, keys, credentials) are never sent automatically. This includes untracked files in the snapshot. The agent is told what was left out.
+
+Each delivery lands on the host as a folder and a git ref, with a receipt: source commit, tree, SHA-256, and who approved it.
+
+**When it's still blocked.** If the host agent can't go on, its result comes back marked blocked, with exactly what it needs. Your opencode agent then gets what's missing and follows up in the same thread, up to `autoFollowUps` times in a row (default 2). After that it stops and tells you. Typing `/handoff` yourself resets the count.
+
+In Kilo, which has no tools for plugins, you get the same requests, approvals and blocked results, but you do the follow-ups with `/handoff`.
+
 ### Durability
 
 | Situation | What happens |
@@ -188,6 +216,8 @@ The host refuses jobs from any client you haven't confirmed. Pair as many client
 /handoff --branch <instructions>           keep the result on its own branch
 /handoff status                            recent handoffs, progress, this client's fingerprint
 /handoff reply <id> <answer>               answer the agent's question
+/handoff approve <id>                      send material an agent asked for from outside the repository
+/handoff deny <id> [reason]                refuse it
 /handoff cancel <id>
 /handoff config [key [value|reset]]        client settings (below)
 /handoff help
@@ -267,6 +297,7 @@ The relay URL, token, keys and T3 login live in `~/.config/handoff/daemon.json`.
 | `resume` | `true` | Let the local agent take a turn when a result arrives. |
 | `transcriptChars` | `120000` | Maximum session transcript sent with a handoff. |
 | `brief` | `true` | Have the session's model write the brief. `false` sends your request as typed. |
+| `autoFollowUps` | `2` | How many times in a row the local agent may follow up a blocked handoff on its own. `0` leaves it to you. |
 
 Client settings live in `~/.config/handoff/client.json`, and pairing details in `device.json`.
 
@@ -288,6 +319,7 @@ Client settings live in `~/.config/handoff/client.json`, and pairing details in 
 - **No inbound exposure.** No machine needs an open port. If you want SSO or MFA in front of the relay as well, put Cloudflare Access on it and set `relayHeaders` (host) or `headers` (client) to a service token.
 - **T3 access.** Only the daemon talks to T3's local MCP endpoint, using a token you approve in the browser.
 - **The agent.** It's told never to push or fetch. Credentials embedded in remote URLs are stripped before sending.
+- **What leaves the client.** Untracked files that look like secrets (`.env` files, keys, credentials) are left out of snapshots. Extra material either agent asks for is sent automatically only from the handed-off repository, without secret-looking files. Anything else needs `/handoff approve`.
 - **Code you're allowed to move.** handoff copies repositories from the client to the host, encrypted in transit and at rest in the relay. Only use it with code you're permitted to copy to that host, and check your organization's policies before using it with work repositories.
 
 ### Free-tier usage
@@ -318,6 +350,8 @@ RELAY_URL=http://localhost:8787 HOST_TOKEN=dev-host-token-0123456789 npm test   
 npm run package:plugin                                      # dist/handoff-plugin.tar.gz for a release
 npm run package:kilo                                        # dist/handoff-kilo.js for a release
 KILO_BIN=$(which kilo) KILO_MODEL=kilo/kilo-auto/free RELAY_URL=... HOST_TOKEN=... npx vitest run tests/kilo-live  # the Kilo client in a real `kilo serve`, with a free model
+OPENCODE_BIN=$(which opencode) RELAY_URL=... HOST_TOKEN=... npx vitest run tests/opencode-live  # opencode's agent calls the handoff tool in a real `opencode serve`
+LIVE_T3=1 RELAY_URL=... HOST_TOKEN=... npx vitest run tests/inputs-live  # a real T3 agent asks for a branch, and ends BLOCKED when it can't get one
 ```
 
 | Package | What it is |
@@ -337,6 +371,7 @@ The end-to-end test runs the real plugin engine, relay and daemon runner, with a
 - refusing forged and unconfirmed jobs
 - choosing models from the request
 - settings
+- the host agent asking for a branch mid-run, and a blocked result followed up by the client
 
 ### Known limits
 

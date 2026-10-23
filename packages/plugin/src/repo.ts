@@ -5,6 +5,7 @@ import { copyFile, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { git, gitOk, revParse } from "@handoff/shared/git"
+import { isSecretPath } from "./secrets.js"
 
 const FALLBACK_IDENTITY = {
   GIT_AUTHOR_NAME: "handoff",
@@ -17,7 +18,7 @@ export async function repoTop(directory: string): Promise<string> {
   return git(["rev-parse", "--show-toplevel"], { cwd: directory })
 }
 
-async function identityEnv(cwd: string): Promise<Record<string, string>> {
+export async function identityEnv(cwd: string): Promise<Record<string, string>> {
   const name = await git(["config", "user.name"], { cwd }).catch(() => "")
   const email = await git(["config", "user.email"], { cwd }).catch(() => "")
   return name && email ? {} : FALLBACK_IDENTITY
@@ -25,14 +26,27 @@ async function identityEnv(cwd: string): Promise<Record<string, string>> {
 
 /** Tree of the working directory as `git add -A` would stage it, using a throwaway index. */
 export async function workingTree(cwd: string): Promise<string> {
+  return (await workingTreeWithSkips(cwd)).tree
+}
+
+/** Untracked files that look like secrets; they stay out of every snapshot. */
+export async function untrackedSecrets(cwd: string): Promise<string[]> {
+  const out = await git(["ls-files", "-z", "--others", "--exclude-standard"], { cwd })
+  return out.split("\0").filter((p) => p && isSecretPath(p))
+}
+
+/** The working tree minus untracked secret-looking files, and which files those were. */
+export async function workingTreeWithSkips(cwd: string): Promise<{ tree: string; skipped: string[] }> {
   const dir = await mkdtemp(join(tmpdir(), "handoff-idx-"))
   const index = join(dir, "index")
   try {
     const realIndex = await git(["rev-parse", "--path-format=absolute", "--git-path", "index"], { cwd })
     await copyFile(realIndex, index).catch(() => {}) // reuse stat cache when present
-    const env = { GIT_INDEX_FILE: index }
-    await git(["add", "-A", "--", "."], { cwd, env })
-    return await git(["write-tree"], { cwd, env })
+    const env = { GIT_INDEX_FILE: index, GIT_LITERAL_PATHSPECS: "1" }
+    const skipped = await untrackedSecrets(cwd)
+    await git(["add", "-A", "--", "."], { cwd, env: { GIT_INDEX_FILE: index } })
+    if (skipped.length) await git(["rm", "-q", "--cached", "--ignore-unmatch", "--", ...skipped], { cwd, env })
+    return { tree: await git(["write-tree"], { cwd, env }), skipped }
   } finally {
     await rm(dir, { recursive: true, force: true })
   }
@@ -44,12 +58,14 @@ export interface Snapshot {
   snapshot: string
   snapshotRef: string
   remotes: Record<string, string>
+  /** Untracked secret-looking files left out. */
+  skipped: string[]
 }
 
 export async function takeSnapshot(cwd: string, jobId: string): Promise<Snapshot> {
   const head = await revParse(cwd, "HEAD")
   const branch = (await git(["symbolic-ref", "--short", "-q", "HEAD"], { cwd }).catch(() => "")) || null
-  const tree = await workingTree(cwd)
+  const { tree, skipped } = await workingTreeWithSkips(cwd)
   let snapshot = head
   if (!head || (await git(["rev-parse", `${head}^{tree}`], { cwd })) !== tree) {
     const args = ["commit-tree", tree, "-m", `WIP: uncommitted changes at handoff (${jobId})`]
@@ -58,14 +74,14 @@ export async function takeSnapshot(cwd: string, jobId: string): Promise<Snapshot
   }
   const snapshotRef = `refs/handoff/${jobId}/snapshot`
   await git(["update-ref", snapshotRef, snapshot!], { cwd })
-  return { branch, head, snapshot: snapshot!, snapshotRef, remotes: await remotes(cwd) }
+  return { branch, head, snapshot: snapshot!, snapshotRef, remotes: await remotes(cwd), skipped }
 }
 
 /** Re-point a previous job's snapshot at a new job id (used when resubmitting). */
 export async function adoptSnapshot(cwd: string, jobId: string, prev: { branch: string | null; head: string | null; snapshot: string }): Promise<Snapshot> {
   const snapshotRef = `refs/handoff/${jobId}/snapshot`
   await git(["update-ref", snapshotRef, prev.snapshot], { cwd })
-  return { branch: prev.branch, head: prev.head, snapshot: prev.snapshot, snapshotRef, remotes: await remotes(cwd) }
+  return { branch: prev.branch, head: prev.head, snapshot: prev.snapshot, snapshotRef, remotes: await remotes(cwd), skipped: [] }
 }
 
 async function remotes(cwd: string): Promise<Record<string, string>> {
@@ -98,7 +114,7 @@ export async function createBundle(cwd: string, snap: Snapshot, base: string | n
 }
 
 export type ApplyOutcome =
-  | { kind: "fast-forwarded"; branch: string }
+  | { kind: "fast-forwarded"; branch: string; note?: string }
   | { kind: "branch-only"; reason: string }
   | { kind: "no-changes" }
 
@@ -145,13 +161,21 @@ export async function applyResult(input: {
 
   // Working tree == snapshot, so its uncommitted changes are already inside the
   // snapshot commit. Stash them, fast-forward, and drop the stash on success.
-  const dirty = head ? (await git(["rev-parse", `${head}^{tree}`], { cwd })) !== snapshotTree : true
+  // Untracked secret files aren't in the snapshot, so they're stashed too and must come back.
+  const secrets = await untrackedSecrets(cwd)
+  const dirty = secrets.length > 0 || (head ? (await git(["rev-parse", `${head}^{tree}`], { cwd })) !== snapshotTree : true)
   if (dirty) await git(["stash", "push", "--include-untracked", "-q", "-m", `handoff ${resultBranch}`], { cwd })
   try {
     await git(["merge", "--ff-only", "-q", resultBranch], { cwd })
   } catch (err) {
     if (dirty) await git(["stash", "pop", "-q"], { cwd }).catch(() => {})
     return { kind: "branch-only", reason: `fast-forward failed: ${(err as Error).message.split("\n")[0]}` }
+  }
+  if (secrets.length) {
+    // The stash's third parent holds its untracked files. Keep the stash if they can't be restored.
+    const restored = await gitOk(["checkout", "stash@{0}^3", "--", ...secrets], { cwd, env: { GIT_LITERAL_PATHSPECS: "1" } })
+    if (restored) await git(["reset", "-q", "--", ...secrets], { cwd, env: { GIT_LITERAL_PATHSPECS: "1" } }).catch(() => {})
+    else return { kind: "fast-forwarded", branch, note: "Your untracked secret files are in `git stash list` (top entry); restore them with `git checkout stash@{0}^3 -- <file>`." }
   }
   if (dirty) await git(["stash", "drop", "-q"], { cwd }).catch(() => {})
   return { kind: "fast-forwarded", branch }

@@ -168,7 +168,7 @@ export default {
         }
         if (description !== "handoff" && !description.startsWith("handoff ")) return
         const finished = text.startsWith("## Handoff") || text.startsWith("## Update from T3")
-        const failed = /failed|ended without success/i.test(firstLine(text))
+        const failed = /failed|ended without success|is blocked|: blocked/i.test(firstLine(text))
         context.ui.toast.show({
           title: "handoff",
           message: firstLine(text).slice(0, 300),
@@ -176,7 +176,7 @@ export default {
           duration: 10000,
           sessionID,
         })
-        if (finished || /has a question/.test(text)) {
+        if (finished || /has a question|wants material from outside|asked for:/.test(text)) {
           void context.attention.notify({ title: "handoff", message: firstLine(text).slice(0, 200), notification: true, sound: { name: finished ? "done" : "question" } })
         }
       }),

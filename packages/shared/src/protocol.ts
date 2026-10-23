@@ -94,6 +94,109 @@ export interface RequestManifest {
     /** Lead model: a spec or a short name like "opus"; the host checks it against its allowed models. */
     model?: string
   }
+  /**
+   * Extra material the brief asked for (other branches, commits, repositories). Their bundles
+   * follow the snapshot bundle in the payload, in this order; the snapshot bundle is what's left.
+   */
+  inputs?: InputBatch
+  /** Untracked files left out of the snapshot because they look like secrets. */
+  skipped?: string[]
+}
+
+// ---------- Inputs: more material from the client ----------
+
+/**
+ * Something the host agent (or the client's brief) asks the client to send: a branch or
+ * commit of the handoff's repository, or files from another repository or folder.
+ */
+export interface InputSpec {
+  /** Short lowercase-hyphenated name; the delivered input is filed under it on the host. */
+  name: string
+  /** Repository or folder on the client; omitted means the handoff's repository. */
+  repo?: string
+  /** Branch, tag, remote branch or commit; omitted means the current files. */
+  ref?: string
+  /** Only these paths, relative to the repository; omitted means everything. */
+  paths?: string[]
+  /** "source" (default): the files at `ref`, as one commit without history. "history": `ref` with its commits. */
+  mode?: "source" | "history"
+  /** Why it's needed; shown to the user when they're asked to approve. */
+  reason?: string
+}
+
+export interface DeliveredInput {
+  name: string
+  /** Where it came from, as the client describes it (a path on the client). */
+  repo: string
+  /** What was asked for and what it resolved to. */
+  ref: string | null
+  sourceCommit: string | null
+  paths: string[]
+  mode: "source" | "history"
+  /** The delivered commit: for "source", a new parentless commit of the selected files. */
+  commit: string
+  tree: string
+  /** Ref inside this input's bundle that points at `commit`. */
+  bundleRef: string
+  /** Bytes of this input's bundle in the payload, and their SHA-256. */
+  size: number
+  sha256: string
+  /** Files left out because they look like secrets (.env, keys, credentials). */
+  skipped: string[]
+  /** "policy": allowed by the client's sharing settings. "user": the user approved it. */
+  approvedBy: "policy" | "user"
+}
+
+export interface RefusedInput {
+  name: string
+  reason: string
+}
+
+export interface InputBatch {
+  delivered: DeliveredInput[]
+  refused: RefusedInput[]
+}
+
+/** Host -> device, sent as a "question" event: the agent asks the client for inputs. */
+export interface InputRequestPayload {
+  type: "inputs"
+  requestId: string
+  threadId?: string
+  inputs: InputSpec[]
+  /** Anything else the agent said about what it needs. */
+  note?: string
+}
+
+/**
+ * Device -> host, sent as a "reply" event on the handoff: inputs are on their way in a
+ * separate relay job, `deliveryJobId`, whose request is an InputsManifest.
+ */
+export interface DeliveryNotice {
+  type: "inputs"
+  deliveryJobId: string
+}
+
+/** Header of a delivery's request container. Bundles follow in `delivered` order. */
+export interface InputsManifest extends InputBatch {
+  v: typeof PROTOCOL_VERSION
+  kind: "inputs"
+  jobId: string
+  deviceId: string
+  /** The handoff the inputs are for. */
+  parentJobId: string
+  /** The agent's request this answers; absent when the client sent them on its own. */
+  requestId?: string
+  /** A note for the host agent from the client's agent or user. */
+  message?: string
+}
+
+/** Header of a delivery's result: the host's receipt. */
+export interface InputsReceipt {
+  v: typeof PROTOCOL_VERSION
+  kind: "inputs-receipt"
+  jobId: string
+  parentJobId: string
+  imported: string[]
 }
 
 /** A task brief the client's model writes from the session before handing off. */
@@ -114,6 +217,8 @@ export interface HandoffBrief {
   context: "full" | "reference" | "none"
   /** Repository-relative files the agent should read first. */
   files: string[]
+  /** Material beyond the checkout the work depends on; the client packages and sends it. */
+  inputs?: InputSpec[]
 }
 
 /** Header of the result container the host returns (encrypted to the device key). */
@@ -132,7 +237,10 @@ export interface ResultManifest {
   parentJobId?: string
   /** For "host" updates: the latest message the user sent the agent in T3, if any. */
   request?: string
-  outcome: "succeeded" | "failed"
+  /** "blocked": the agent stopped because it lacks something only the client can provide. */
+  outcome: "succeeded" | "failed" | "blocked"
+  /** For "blocked": what the agent says it needs. */
+  missing?: string
   /** Branch inside the bundle holding the agent's commits (child of the snapshot). */
   branch: string
   /** Tip of `branch`, or null if no bundle (no commits). */
@@ -156,11 +264,13 @@ export interface StatusPayload {
   activity?: "busy" | "idle"
 }
 export interface QuestionPayload {
+  type?: undefined
   requestId: string
   threadId: string
   question: unknown
 }
 export interface ReplyPayload {
+  type?: undefined
   requestId: string
   answers: Record<string, unknown>
 }

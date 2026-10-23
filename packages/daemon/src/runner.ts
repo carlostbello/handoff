@@ -2,11 +2,12 @@
 // -> bundle agent commits -> encrypt -> upload. Each step is checkpointed in the
 // local state file so a daemon restart (or host reboot) resumes where it left off.
 
-import { mkdir, rm, stat, writeFile, readFile } from "node:fs/promises"
+import { mkdir, readdir, rename, rm, stat, writeFile, readFile } from "node:fs/promises"
 import { join } from "node:path"
 import {
   PROTOCOL_VERSION,
   HostClient,
+  RelayError,
   open,
   openJson,
   packContainer,
@@ -21,6 +22,11 @@ import {
   type EventKind,
   type ModelSelection,
   type ErrorPayload,
+  type DeliveryNotice,
+  type InputRequestPayload,
+  type InputSpec,
+  type InputsManifest,
+  type InputsReceipt,
   type JobRecord,
   type QuestionPayload,
   type RelayEvent,
@@ -53,8 +59,9 @@ export type T3Like = Pick<
   | "interrupt"
   | "close"
 >
-import { buildFollowUpPrompt, buildPrompt, type ContextFiles } from "./prompt.js"
+import { buildFollowUpPrompt, buildPrompt, type ContextFiles, type InputsContext } from "./prompt.js"
 import { describeResolution, resolveModels } from "./models.js"
+import { NOTE_PREFIX, combineNotes, deliveryNote, importInputs, parseBlocked, parseInputRequest, splitPayload, type ImportedInput } from "./inputs.js"
 
 type Phase = "claimed" | "launched" | "collecting" | "uploaded" | "failed" | "cancelled"
 
@@ -76,6 +83,27 @@ interface LocalJob {
   sessionId?: string
   /** Set when this job continued an existing thread: its latest run before the follow-up was sent. */
   baselineRunId?: string | null
+  /** Inputs the agent asked the client for, from files in `<jobDir>/requests/`. */
+  inputRequests?: InputRequestRecord[]
+  /** Delivery jobs the client announced for this job; `claimed` once this host claimed one. */
+  expectedDeliveries?: Array<{ id: string; claimed?: boolean }>
+  /** Messages for the agent, sent into the thread once it is idle. */
+  notes?: string[]
+  /** How many note messages were sent (for stable client request ids). */
+  notesSent?: number
+}
+
+interface InputRequestRecord {
+  requestId: string
+  /** The request file's name in `<jobDir>/requests/`. */
+  file: string
+  inputs: InputSpec[]
+  note?: string
+  at: number
+  /** Posted to the client and the file renamed to `.sent`. */
+  sent?: boolean
+  /** A delivery answered it (or failed in a way that ends it). */
+  answered?: boolean
 }
 
 /**
@@ -277,10 +305,17 @@ export class Runner {
       await this.save()
       if (page.events.length < 200) break
     }
+    // Deliveries are cheap and a running job is waiting on them: handle them now, outside the
+    // concurrency limit (a full slot must not block the delivery its own job waits for).
+    const expected = this.expectedDeliveries()
+    for (const [id, { parent, claimed }] of expected) {
+      const record = queued.find((j) => j.id === id)
+      if (claimed || record) await this.processDelivery(parent, id, record)
+    }
     let claimedCount = 0
     for (const job of queued.reverse()) {
       if (this.active.size >= this.config.concurrency) break
-      if (this.state.jobs[job.id]) continue
+      if (this.state.jobs[job.id] || expected.has(job.id)) continue
       const claimed = await this.relay.claim(job.id)
       if (!claimed) continue
       await this.update({ id: job.id, deviceId: job.deviceId, phase: "claimed", startedAt: Date.now() }, {})
@@ -322,9 +357,162 @@ export class Runner {
       const job = this.state.jobs[ev.jobId]
       if (job?.threadId) await this.t3.interrupt(job.threadId, "Cancelled from client", `handoff-cancel-${ev.jobId}`).catch(() => {})
     } else if (ev.kind === "reply") {
-      const reply = await this.openEvent<ReplyPayload>(ev)
+      const reply = await this.openEvent<ReplyPayload | DeliveryNotice>(ev)
+      if (reply.type === "inputs") {
+        // Inputs are on their way in a separate job; claim it as soon as it is queued.
+        const job = this.state.jobs[ev.jobId]!
+        if (!/^[0-9A-Z]{26}$/.test(reply.deliveryJobId) || this.state.jobs[reply.deliveryJobId]) return
+        if (!job.expectedDeliveries?.some((d) => d.id === reply.deliveryJobId)) {
+          await this.update(job, { expectedDeliveries: [...(job.expectedDeliveries ?? []), { id: reply.deliveryJobId }] })
+        }
+        this.requestSync()
+        return
+      }
       this.replies.set(ev.jobId, [...(this.replies.get(ev.jobId) ?? []), reply])
     }
+  }
+
+  private expectedDeliveries(): Map<string, { parent: LocalJob; claimed: boolean }> {
+    const out = new Map<string, { parent: LocalJob; claimed: boolean }>()
+    for (const parent of Object.values(this.state.jobs)) {
+      for (const d of parent.expectedDeliveries ?? []) out.set(d.id, { parent, claimed: !!d.claimed })
+    }
+    return out
+  }
+
+  // ---------- inputs ----------
+
+  /**
+   * A delivery job: inputs the client sent for `parent`. Claim it, import the inputs into the
+   * parent's mirror and job folder, return a receipt, and queue a note for the agent.
+   * `opened` is the request plaintext when it was already downloaded (a delivery claimed as a handoff).
+   */
+  private async processDelivery(parent: LocalJob, id: string, record?: JobRecord, opened?: Uint8Array): Promise<void> {
+    const entry = () => parent.expectedDeliveries?.find((d) => d.id === id)
+    let requestId: string | undefined
+    try {
+      if (record && record.deviceId !== parent.deviceId) throw new Error("delivery from another device")
+      if (!opened && !entry()?.claimed) {
+        if (!(await this.relay.claim(id))) return // not claimable (yet): a later sync retries
+        await this.update(parent, { expectedDeliveries: (parent.expectedDeliveries ?? []).map((d) => (d.id === id ? { ...d, claimed: true } : d)) })
+      }
+      const deviceKey = await this.deviceKey(parent.deviceId)
+      const plain = opened ?? (await open(await this.relay.downloadRequest(id), this.config.keys, deviceKey, sealContext.request(id)))
+      const { header: manifest, payload } = unpackContainer<InputsManifest>(plain)
+      if (manifest.v !== PROTOCOL_VERSION) throw new Error(`unsupported protocol v${manifest.v}`)
+      if (manifest.kind !== "inputs" || manifest.jobId !== id) throw new Error("not an inputs delivery")
+      if (manifest.parentJobId !== parent.id || manifest.deviceId !== parent.deviceId) throw new Error("delivery is for another job or device")
+      requestId = manifest.requestId
+      if (!parent.repoDir) throw new Error(`job ${parent.id} has no repository yet`)
+      const delivered = Array.isArray(manifest.delivered) ? manifest.delivered : []
+      const refused = Array.isArray(manifest.refused) ? manifest.refused : []
+      const { lead, bundles } = splitPayload(payload, delivered)
+      if (lead.length) throw new Error("unexpected data before the input bundles")
+      const { imported, failed } = await importInputs({
+        repoDir: parent.repoDir,
+        jobDir: this.jobDir(parent.id),
+        jobId: parent.id,
+        items: delivered.map((input, i) => ({ input, bytes: bundles[i]! })),
+      })
+      const receipt: InputsReceipt = { v: PROTOCOL_VERSION, kind: "inputs-receipt", jobId: id, parentJobId: parent.id, imported: imported.map((i) => i.name) }
+      await this.relay.uploadResult(id, await seal(packContainer(receipt), deviceKey, this.config.keys, sealContext.result(id)))
+      const note = deliveryNote({ inputsDir: join(this.jobDir(parent.id), "inputs"), imported, refused: [...refused, ...failed], ...(manifest.message ? { message: manifest.message } : {}) })
+      await this.settleDelivery(parent, id, note, requestId, [...delivered.map((d) => d.name), ...refused.map((r) => r.name)])
+      await this.notify(parent, imported.length ? `Received from the user's machine: ${imported.map((i) => i.name).join(", ")}` : "The user's machine sent no inputs")
+      log(`job ${parent.id}: delivery ${id} imported (${imported.length} inputs, ${refused.length + failed.length} not sent)`)
+    } catch (err) {
+      // A relay hiccup: keep the delivery expected and try again on a later sync.
+      if (err instanceof RelayError && err.retryable) return log(`delivery ${id}: ${err.message}; will retry`)
+      const message = (err as Error).message
+      log(`delivery ${id} for job ${parent.id} failed: ${message}`)
+      try {
+        const payload: ErrorPayload = { message, code: "delivery_failed" }
+        await this.relay.postEvent(id, "error", await sealJson(payload, await this.deviceKey(parent.deviceId), this.config.keys, sealContext.event("error", id)))
+        await this.relay.setStatus(id, "failed", "delivery_failed")
+      } catch (e) {
+        log(`delivery ${id}: could not report failure:`, (e as Error).message)
+      }
+      const note = `A delivery of inputs from the user's machine failed on this host: ${message}. Ask again (write a new request file) if you still need them.`
+      await this.settleDelivery(parent, id, note, requestId, null)
+    }
+  }
+
+  /**
+   * End a delivery: drop it from the expected list, mark the request it answers, and queue the
+   * note. Without a request id, a request is answered when the delivery covers all its names
+   * (`names`), or, for a failed delivery (`names` null), every open request is.
+   */
+  private async settleDelivery(parent: LocalJob, id: string, note: string, requestId: string | undefined, names: string[] | null): Promise<void> {
+    const answers = (r: InputRequestRecord) =>
+      requestId ? r.requestId === requestId : names ? r.inputs.every((i) => names.includes(i.name)) : true
+    await this.update(parent, {
+      expectedDeliveries: (parent.expectedDeliveries ?? []).filter((d) => d.id !== id),
+      inputRequests: (parent.inputRequests ?? []).map((r) => (!r.answered && answers(r) ? { ...r, answered: true } : r)),
+      notes: [...(parent.notes ?? []), note],
+    })
+    // A job that already finished gets the note from pollConversations once its thread is idle.
+    this.requestSync()
+  }
+
+  /** Request files the agent wrote: post each to the client as a question, once. */
+  private async scanInputRequests(job: LocalJob): Promise<void> {
+    const dir = join(this.jobDir(job.id), "requests")
+    for (const r of job.inputRequests ?? []) if (!r.sent) await this.postInputRequest(job, r)
+    const files = (await readdir(dir).catch(() => [] as string[])).filter((f) => f.endsWith(".json")).sort()
+    for (const file of files) {
+      const path = join(dir, file)
+      // Still recorded as unsent: posting failed and is retried above.
+      if ((job.inputRequests ?? []).some((r) => r.file === file && !r.sent)) continue
+      let parsed: ReturnType<typeof parseInputRequest>
+      try {
+        const text = await readFile(path, "utf8").catch(() => null)
+        if (text === null) continue
+        let raw: unknown
+        try {
+          raw = JSON.parse(text)
+        } catch (err) {
+          // Probably still being written.
+          if (Date.now() - (await stat(path)).mtimeMs < 5000) continue
+          throw new Error(`not valid JSON (${(err as Error).message})`)
+        }
+        parsed = parseInputRequest(raw)
+      } catch (err) {
+        await rename(path, `${path}.invalid`).catch(() => {})
+        const note = `Your request for inputs \`${path}\` wasn't sent: ${(err as Error).message}. It was renamed to \`${file}.invalid\`; fix it and write it again as a new .json file.`
+        await this.update(job, { notes: [...(job.notes ?? []), note] })
+        continue
+      }
+      // Recorded before posting, so a restart re-posts it under the same id instead of losing it.
+      const record: InputRequestRecord = { requestId: ulid(), file, inputs: parsed.inputs, ...(parsed.note ? { note: parsed.note } : {}), at: Date.now() }
+      await this.update(job, { inputRequests: [...(job.inputRequests ?? []), record] })
+      await this.postInputRequest(job, record)
+    }
+  }
+
+  private async postInputRequest(job: LocalJob, record: InputRequestRecord): Promise<void> {
+    try {
+      const payload: InputRequestPayload = { type: "inputs", requestId: record.requestId, threadId: job.threadId, inputs: record.inputs, ...(record.note ? { note: record.note } : {}) }
+      await this.relay.postEvent(job.id, "question", await this.sealEvent(job, "question", payload))
+    } catch (err) {
+      return log(`job ${job.id}: could not send input request ${record.requestId}:`, (err as Error).message)
+    }
+    const path = join(this.jobDir(job.id), "requests", record.file)
+    await rename(path, `${path}.sent`).catch(() => {})
+    await this.update(job, { inputRequests: (job.inputRequests ?? []).map((r) => (r.requestId === record.requestId ? { ...r, sent: true } : r)) })
+    await this.notify(job, `The agent asked for: ${record.inputs.map((i) => i.name).join(", ")}`)
+  }
+
+  /** Send queued notes into the thread as one message; the caller makes sure the thread is idle. */
+  private async sendNotes(job: LocalJob, threadId: string): Promise<void> {
+    const count = job.notes?.length ?? 0
+    if (!count) return
+    const message = combineNotes(job.notes!.slice(0, count))
+    const n = (job.notesSent ?? 0) + 1
+    // Like a follow-up: the job waits for the run this message starts.
+    await this.update(job, { baselineRunId: (await this.t3.thread(threadId)).latestRunId })
+    await this.t3.send(threadId, message, `handoff-note-${job.id}-${n}`)
+    // Notes queued while sending stay for the next message.
+    await this.update(job, { notes: (job.notes ?? []).slice(count), notesSent: n })
   }
 
   // ---------- job lifecycle ----------
@@ -397,6 +585,22 @@ export class Runner {
     return join(this.config.jobsDir, id)
   }
 
+  /**
+   * A delivery claimed as if it were a handoff (it was queued before its notice arrived):
+   * never run it as a handoff; process it as the delivery it is.
+   */
+  private async redirectDelivery(job: LocalJob, plain: Uint8Array): Promise<void> {
+    const { header } = unpackContainer<InputsManifest>(plain)
+    const parent = this.state.jobs[header.parentJobId]
+    if (!parent || parent.deviceId !== job.deviceId) throw new Error("inputs delivery for an unknown job")
+    await this.update(job, { phase: "uploaded" })
+    await rm(this.jobDir(job.id), { recursive: true, force: true })
+    // Expected and already claimed, so a later sync retries it if this attempt hits a relay error.
+    const others = (parent.expectedDeliveries ?? []).filter((d) => d.id !== job.id)
+    await this.update(parent, { expectedDeliveries: [...others, { id: job.id, claimed: true }] })
+    await this.processDelivery(parent, job.id, undefined, plain)
+  }
+
   private async prepareAndLaunch(job: LocalJob): Promise<void> {
     const dir = this.jobDir(job.id)
     await mkdir(dir, { recursive: true, mode: 0o700 })
@@ -405,10 +609,15 @@ export class Runner {
     const deviceKey = await this.deviceKey(job.deviceId)
     const sealed = await this.relay.downloadRequest(job.id)
     const plain = await open(sealed, this.config.keys, deviceKey, sealContext.request(job.id))
-    const { header: manifest, payload: bundle } = unpackContainer<RequestManifest>(plain)
+    const { header: manifest, payload } = unpackContainer<RequestManifest>(plain)
+    if ((manifest as { kind?: string }).kind === "inputs") return this.redirectDelivery(job, plain)
     if (manifest.v !== PROTOCOL_VERSION) throw Object.assign(new Error(`unsupported protocol v${manifest.v}`), { code: "protocol" })
     if (manifest.jobId !== job.id || manifest.deviceId !== job.deviceId) throw new Error("manifest job or device mismatch")
     if (!/^refs\/handoff\/[0-9A-Z]{26}\/snapshot$/.test(manifest.repo.snapshotRef)) throw new Error("invalid snapshot ref")
+    // Input bundles follow the snapshot bundle; the snapshot bundle is what's left in front.
+    const delivered = manifest.inputs?.delivered ?? []
+    const { lead: bundle, bundles: inputBundles } = splitPayload(payload, delivered)
+    await mkdir(join(dir, "requests"), { recursive: true, mode: 0o700 })
 
     const bundlePath = join(dir, "request.bundle")
     await writeFile(bundlePath, bundle, { mode: 0o600 })
@@ -449,6 +658,23 @@ export class Runner {
     const snapshot = await revParse(repoDir, baseBranch)
     if (snapshot !== manifest.repo.snapshot) throw new Error(`snapshot mismatch: got ${snapshot}, expected ${manifest.repo.snapshot}`)
 
+    // Extra material the brief asked for. One that can't be imported is reported to the agent, not fatal.
+    let imported: ImportedInput[] = []
+    let refused = manifest.inputs?.refused ?? []
+    if (delivered.length) {
+      const res = await importInputs({ repoDir, jobDir: dir, jobId: job.id, items: delivered.map((input, i) => ({ input, bytes: inputBundles[i]! })) })
+      imported = res.imported
+      refused = [...refused, ...res.failed]
+    }
+    const inputs: InputsContext = {
+      jobId: job.id,
+      requestsDir: join(dir, "requests"),
+      inputsDir: join(dir, "inputs"),
+      imported,
+      refused,
+      skipped: (manifest.skipped ?? []).filter((f) => typeof f === "string"),
+    }
+
     // Keep the mirror's own checkout on the latest snapshot so T3 sees a valid repo.
     const dirty = (await git(["status", "--porcelain"], { cwd: repoDir })).trim()
     if (!dirty) await git(["checkout", "-q", "-B", "handoff-mirror", snapshot], { cwd: repoDir }).catch(() => {})
@@ -462,7 +688,7 @@ export class Runner {
     const conversation = this.state.conversations[conversationKey]
     if (conversation && conversation.repoKey === repoKey && (await this.canContinue(conversation, snapshot))) {
       await this.update(job, { repoDir, baseBranch, branch: conversation.branch, snapshot, projectId: project.id, threadTitle: conversation.threadTitle, sessionId: manifest.session.id })
-      await this.continueConversation(job, conversation, manifest, snapshot, files, models)
+      await this.continueConversation(job, conversation, manifest, snapshot, files, models, inputs)
       return
     }
 
@@ -485,6 +711,7 @@ export class Runner {
         models,
         instructions: this.config.instructions,
         excerptChars: this.config.promptTranscriptChars,
+        inputs,
       })
       threadId = await this.t3.launch({
         projectId: project.id,
@@ -562,6 +789,7 @@ export class Runner {
     snapshot: string,
     files: ContextFiles,
     models: ReturnType<typeof resolveModels>,
+    inputs: InputsContext,
   ): Promise<void> {
     conversation.activeJobId = job.id
     conversation.updatedAt = Date.now()
@@ -573,7 +801,7 @@ export class Runner {
     await git(["merge", "--ff-only", "-q", snapshot], { cwd: worktree })
     const lead = await this.leadForFollowUp(conversation, thread, models)
     await this.notify(job, `${lead} Continuing T3 thread "${conversation.threadTitle}".`, true)
-    const message = buildFollowUpPrompt({ manifest, branch: conversation.branch, snapshot, files, models })
+    const message = buildFollowUpPrompt({ manifest, branch: conversation.branch, snapshot, files, models, inputs })
     await this.update(job, { threadId: conversation.threadId, baselineRunId: thread.latestRunId })
     await this.t3.send(conversation.threadId, message, `handoff-${job.id}`)
     await this.update(job, { phase: "launched" })
@@ -640,6 +868,7 @@ export class Runner {
       if (this.stopping) throw new Error("daemon stopping")
       if (this.cancels.has(job.id)) return
       const res = await this.t3.wait(threadId, 60_000)
+      await this.scanInputRequests(job)
       // A follow-up was sent to a thread whose previous run already finished: wait for the new run.
       const followUpPending = job.baselineRunId !== undefined && res.runId === job.baselineRunId
       if (followUpPending && Date.now() <= deadline) {
@@ -648,15 +877,28 @@ export class Runner {
       }
       if (res.timedOut || ACTIVE_STATUSES.includes(res.status)) {
         idleSince = null
+      } else if (job.notes?.length) {
+        // The lead is idle: deliver what arrived meanwhile (inputs, request errors); it starts a new run.
+        await this.sendNotes(job, threadId)
+        idleSince = null
+        waitingOn = ""
+        continue
       } else {
         // The run ended, but the job is only finished once no delegated subagent is still working
         // and the lead has stayed idle long enough for a subagent's report to start a new run.
         const busy = await this.t3.activeSubagents(job.projectId!, threadId)
+        // Inputs the agent asked for and the user's machine hasn't sent yet.
+        const awaited = (job.inputRequests ?? []).filter((r) => !r.answered).flatMap((r) => r.inputs.map((i) => i.name))
         if (busy.length) {
           idleSince = null
           const names = busy.map((b) => b.title).sort().join(", ")
           if (names !== waitingOn) await this.notify(job, `Waiting on subagents: ${names}`)
           waitingOn = names
+        } else if (awaited.length || job.expectedDeliveries?.length) {
+          idleSince = null
+          const names = awaited.length ? awaited.join(", ") : "inputs"
+          if (`inputs:${names}` !== waitingOn) await this.notify(job, `Waiting for the user's machine to send: ${names}`)
+          waitingOn = `inputs:${names}`
         } else if (idleSince === null) {
           idleSince = Date.now()
         } else if (Date.now() - idleSince >= this.settleMs) {
@@ -731,12 +973,15 @@ export class Runner {
     }
 
     const summary = (await this.t3.finalAssistantText(job.threadId!)) || "(The agent finished without a final message.)"
+    // The agent says what it lacks, so the client's agent can send it with a follow-up.
+    const missing = parseBlocked(summary)
     const manifest: ResultManifest = {
       v: PROTOCOL_VERSION,
       jobId: job.id,
       origin: "handoff",
       sessionId: job.sessionId ?? "",
-      outcome: (await this.t3.finalRunStatus(job.threadId!)) === "completed" || commits.length > 0 ? "succeeded" : "failed",
+      outcome: missing !== null ? "blocked" : (await this.t3.finalRunStatus(job.threadId!)) === "completed" || commits.length > 0 ? "succeeded" : "failed",
+      ...(missing !== null ? { missing } : {}),
       branch,
       head: commits.length ? head : null,
       snapshot,
@@ -797,6 +1042,12 @@ export class Runner {
         const subagents = ACTIVE_STATUSES.includes(thread.status) ? [] : await this.t3.activeSubagents(conversation.projectId, conversation.threadId)
         const busy = ACTIVE_STATUSES.includes(thread.status) || subagents.length > 0
         await this.signalActivity(conversation, busy, subagents.map((s) => s.title))
+        // Inputs delivered after the job finished: hand them to the agent once the thread is idle.
+        const noted = busy ? undefined : Object.values(this.state.jobs).find((j) => j.threadId === conversation.threadId && j.notes?.length && !["claimed", "launched", "collecting"].includes(j.phase))
+        if (noted) {
+          await this.sendNotes(noted, conversation.threadId)
+          continue
+        }
         if (!thread.latestRunId || thread.latestRunId === conversation.lastRunId || busy) continue
         // Same settling rule as handoff jobs: a subagent's report can start another run shortly after.
         const seen = this.settling.get(key)
@@ -853,7 +1104,8 @@ export class Runner {
 
     // What the user asked in T3, unless the newest message is one of handoff's own prompts.
     const asked = await this.t3.lastUserMessage(conversation.threadId)
-    const request = asked && !/^(You are continuing work handed off|Follow-up from the user's opencode session)/.test(asked) ? asked : undefined
+    const request = asked && !/^(You are continuing work handed off|Follow-up from the user's opencode session)/.test(asked) && !asked.startsWith(NOTE_PREFIX) ? asked : undefined
+    const missing = parseBlocked(summary)
     const id = ulid()
     await this.relay.createJob(id, conversation.deviceId)
     const dir = this.jobDir(id)
@@ -871,7 +1123,8 @@ export class Runner {
       sessionId: conversation.sessionId,
       parentJobId: conversation.lastJobId,
       ...(request ? { request } : {}),
-      outcome: "succeeded",
+      outcome: missing !== null ? "blocked" : "succeeded",
+      ...(missing !== null ? { missing } : {}),
       branch,
       head: commits.length ? head : null,
       snapshot: conversation.deliveredHead,

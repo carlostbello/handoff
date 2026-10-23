@@ -46,6 +46,7 @@ export function view(job: DeviceJob, now: number): JobView {
   const running = (state: string, tone: Tone = "active", detail = job.lastStatus): JobView => ({ ...base, state, tone, detail, age: duration(now - job.createdAt), live: true })
   const ended = (state: string, tone: Tone, detail = job.lastStatus): JobView => ({ ...base, state, tone, detail, age: `${duration(now - changed)} ago`, live: false })
   if (job.question) return running("needs answer", "attention", `Answer with /handoff reply ${short(job.id)} <answer>`)
+  if (job.inputRequests?.some((r) => r.state === "awaiting-approval")) return running("needs approval", "attention", `Send with /handoff approve ${short(job.id)}, or /handoff deny ${short(job.id)}`)
   switch (job.phase) {
     case "packing":
       return running("packing")
@@ -56,6 +57,7 @@ export function view(job: DeviceJob, now: number): JobView {
     case "applying":
       return running("applying")
     case "applied":
+      if (job.outcome === "blocked" && !job.remote?.active) return ended("blocked", "attention")
       if (job.remote?.active) return { ...running("T3 working", "active", job.remote.note), age: duration(now - job.remote.since) }
       return ended("done", "success")
     case "failed":

@@ -350,6 +350,8 @@ RELAY_URL=http://localhost:8787 HOST_TOKEN=dev-host-token-0123456789 npm test   
 npm run package:plugin                                      # dist/handoff-plugin.tar.gz for a release
 npm run package:kilo                                        # dist/handoff-kilo.js for a release
 KILO_BIN=$(which kilo) KILO_MODEL=kilo/kilo-auto/free RELAY_URL=... HOST_TOKEN=... npx vitest run tests/kilo-live  # the Kilo client in a real `kilo serve`, with a free model
+OPENCODE_BIN=$(which opencode) RELAY_URL=... HOST_TOKEN=... npx vitest run tests/opencode-live  # opencode's agent calls the handoff tool in a real `opencode serve`
+LIVE_T3=1 RELAY_URL=... HOST_TOKEN=... npx vitest run tests/inputs-live  # a real T3 agent asks for a branch, and ends BLOCKED when it can't get one
 ```
 
 | Package | What it is |

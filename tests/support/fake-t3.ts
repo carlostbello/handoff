@@ -27,6 +27,12 @@ export interface FakeHooks {
    * own run keeps going for this many status checks, then commits and finishes.
    */
   leadStillRunningPolls?: number
+  /** Called with the first message and the worktree, like an agent reading its prompt. */
+  onLaunchMessage?: (message: string, worktree: string) => void
+  /** The agent's final message after launch. */
+  launchText?: string
+  /** Called for every message sent into a thread, before the agent's follow-up commit. */
+  onSend?: (message: string, worktree: string) => void
 }
 
 export function createFakeT3(worktreesDir: string, hooks: FakeHooks = {}) {
@@ -82,7 +88,8 @@ export function createFakeT3(worktreesDir: string, hooks: FakeHooks = {}) {
       sh(worktree, "-c", "user.name=Agent", "-c", "user.email=a@x", "commit", "-q", "-m", `Agent: update ${file}`)
       writeFileSync(join(worktree, "NOTES.md"), "left uncommitted\n")
       const threadId = `thread-${threads.size + 1}`
-      threads.set(threadId, { worktree, branch: ws.branch, title: args.title, projectId: args.projectId, run: 1, text: "Made the requested change and left notes. Verified by reading the file." })
+      threads.set(threadId, { worktree, branch: ws.branch, title: args.title, projectId: args.projectId, run: 1, text: hooks.launchText ?? "Made the requested change and left notes. Verified by reading the file." })
+      hooks.onLaunchMessage?.(args.message, worktree)
       launches.push({ message: args.message, branch: ws.branch, baseRef: ws.baseRef, title: args.title, args })
       if (hooks.subagentPolls) subagents.set(threadId, hooks.subagentPolls)
       if (hooks.leadStillRunningPolls) leadRunning.set(threadId, hooks.leadStillRunningPolls)
@@ -100,6 +107,7 @@ export function createFakeT3(worktreesDir: string, hooks: FakeHooks = {}) {
     async send(threadId: string, message: string) {
       const t = threads.get(threadId)!
       sends.push({ threadId, message })
+      hooks.onSend?.(message, t.worktree)
       commitIn(t.worktree, "followup.txt", `follow-up ${sends.length}`, `Agent: follow-up ${sends.length}`)
       t.run++
       t.text = `Handled follow-up ${sends.length}.`

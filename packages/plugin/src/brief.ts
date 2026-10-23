@@ -2,7 +2,7 @@
 // agent: what the user wants, what's been done, what's left. The user's words
 // still travel verbatim alongside it.
 
-import type { HandoffBrief } from "@handoff/shared"
+import { normalizeInputSpec, type HandoffBrief, type InputSpec } from "@handoff/shared"
 
 export function briefPrompt(instructions: string, repoName: string): string {
   const request = instructions.trim() || "(no instructions: continue the work in progress)"
@@ -18,8 +18,11 @@ Reply with ONLY a JSON object, no prose and no code fence:
   "projectName": "a short, human-friendly name for this repository's project, e.g. \\"Recipe Planner\\"",
   "context": "full | reference | none",
   "files": ["repository-relative paths the agent should read first"],
+  "inputs": [{ "name": "short-name", "ref": "branch, tag or commit", "repo": "absolute path, only for another repository or folder", "paths": ["only these paths"], "reason": "why it's needed" }],
   "task": "the brief, in markdown"
 }
+
+"inputs" lists what the work depends on that is NOT in the current checkout's history: another branch or commit (even one on a remote, since the other machine can't fetch), or files from another repository or folder on this machine. Each is packaged and sent with the handoff; naming a branch in the brief alone does not send its contents. Omit "ref" for the current files and "repo" for this repository. Files that look like secrets (.env, keys, credentials) are never sent. Use [] when the checkout has everything.
 
 "context" says how much of this session the other agent should see:
 - "full": it needs the conversation itself (e.g. subtle decisions, back-and-forth it must not repeat).
@@ -68,5 +71,14 @@ export function parseBrief(text: string): HandoffBrief | null {
     .filter((f): f is string => typeof f === "string" && f.trim().length > 0 && !f.includes(".."))
     .map((f) => f.trim().replace(/^\/+/, ""))
     .slice(0, 20)
-  return { title: title || "Handoff", slug: slug || "handoff", projectName, context, files, task: task.slice(0, MAX_TASK_CHARS) }
+  const inputs: InputSpec[] = []
+  for (const raw of Array.isArray(value.inputs) ? value.inputs.slice(0, 10) : []) {
+    try {
+      const spec = normalizeInputSpec(raw)
+      if (!inputs.some((i) => i.name === spec.name)) inputs.push(spec)
+    } catch {
+      // A malformed entry from the model; the host agent can still ask for it.
+    }
+  }
+  return { title: title || "Handoff", slug: slug || "handoff", projectName, context, files, task: task.slice(0, MAX_TASK_CHARS), ...(inputs.length ? { inputs } : {}) }
 }

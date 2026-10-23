@@ -483,4 +483,74 @@ describe.skipIf(!url)("handoff end to end", () => {
     const device = JSON.parse(readFileSync(join(root, "config", "device.json"), "utf8"))
     expect((await new shared.DeviceClient({ url: url!, token: device.token }).getJob(job.id)).status).toBe("delivered")
   }, 60_000)
+
+  /** Run the host until its jobs finish, while the client polls and the host picks up what it sends. */
+  async function runTogether(): Promise<void> {
+    let done = false
+    const run = runner.runOnce().finally(() => (done = true))
+    while (!done) {
+      await engine.pollOnce()
+      await (runner as unknown as { syncRelay(): Promise<number> }).syncRelay()
+      await new Promise((r) => setTimeout(r, 100))
+    }
+    await run
+    await engine.pollOnce()
+  }
+
+  it("delivers a branch the host agent asks for mid-run, without secrets, and the agent continues", async () => {
+    // The material lives on another branch, checked out in another worktree of the same repository.
+    const other = join(root, "work-recorder")
+    sh(work, "worktree", "add", "-q", "-b", "feature/recorder", other)
+    execFileSync("mkdir", ["-p", join(other, "recorder")])
+    writeFileSync(join(other, "recorder", "App.swift"), "struct Recorder {}\n")
+    writeFileSync(join(other, "recorder", ".env"), "API_KEY=secret\n")
+    sh(other, "add", ".")
+    sh(other, "commit", "-q", "-m", "recorder")
+
+    let inputsDir = ""
+    fakeHooks.onLaunchMessage = (message) => {
+      // Like an agent following its prompt: write a request file, then end the turn waiting.
+      const requests = message.match(/`([^`]*\/requests)\/<short-name>\.json`/)![1]!
+      inputsDir = join(requests, "..", "inputs")
+      writeFileSync(join(requests, "need.json"), JSON.stringify({ inputs: [{ name: "recorder", ref: "feature/recorder", paths: ["recorder"], reason: "existing app" }] }))
+    }
+    fakeHooks.onSend = (message, worktree) => {
+      if (!message.includes("recorder")) return
+      writeFileSync(join(worktree, "uses-recorder.txt"), readFileSync(join(inputsDir, "recorder", "recorder", "App.swift"), "utf8"))
+    }
+    writeFileSync(join(work, "mid.txt"), "x\n")
+    await engine.handle("ses_inputs", "/handoff build on the recorder")
+    await runTogether()
+    fakeHooks.onLaunchMessage = undefined
+    fakeHooks.onSend = undefined
+
+    expect(posted.some((p) => /asked for material; sent `recorder`/.test(p.text))).toBe(true)
+    expect(fake.sends.at(-1)!.message).toMatch(/approved there and are inputs for this task/)
+    expect(existsSync(join(inputsDir, "recorder", "recorder", ".env"))).toBe(false)
+    const receipts = JSON.parse(readFileSync(join(inputsDir, "receipts.json"), "utf8"))
+    expect(receipts[0]).toMatchObject({ name: "recorder", approvedBy: "policy", sourceCommit: sh(work, "rev-parse", "feature/recorder"), skipped: ["recorder/.env"] })
+    expect(posted.at(-1)!.text).toMatch(/## Handoff `\w+` finished/)
+    expect(readFileSync(join(work, "uses-recorder.txt"), "utf8")).toBe("struct Recorder {}\n")
+  }, 60_000)
+
+  it("reports a blocked result, and the session's agent follows up in the same thread with what was missing", async () => {
+    fakeHooks.launchText = "Started, but the recorder sources aren't here.\nBLOCKED: the `recorder` folder from branch feature/recorder on the user's machine"
+    writeFileSync(join(work, "blocked.txt"), "x\n")
+    await engine.handle("ses_blocked", "/handoff finish the recorder")
+    await runTogether()
+    fakeHooks.launchText = undefined
+    const blocked = posted.at(-1)!
+    expect(blocked.text).toMatch(/is blocked/)
+    expect(blocked.text).toContain("### What the host agent needs\nthe `recorder` folder from branch feature/recorder")
+    expect(blocked.resume).toBe(true)
+
+    const reply = await engine.agentSend("ses_blocked", { inputs: [{ name: "recorder", ref: "feature/recorder", paths: ["recorder"] }], message: "Here are the recorder sources." })
+    expect(reply).toMatch(/follow-up job/)
+    const sendsBefore = fake.sends.length
+    await runTogether()
+    expect(fake.sends.length).toBe(sendsBefore + 1)
+    expect(fake.sends.at(-1)!.message).toMatch(/Here are the recorder sources/)
+    expect(fake.sends.at(-1)!.message).toMatch(/recorder/)
+    expect(posted.at(-1)!.text).toMatch(/## Handoff `\w+` finished/)
+  }, 60_000)
 })

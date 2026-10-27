@@ -553,4 +553,49 @@ describe.skipIf(!url)("handoff end to end", () => {
     expect(fake.sends.at(-1)!.message).toMatch(/recorder/)
     expect(posted.at(-1)!.text).toMatch(/## Handoff `\w+` finished/)
   }, 60_000)
+
+  it("reports client problems and the plugin version to the host", async () => {
+    // Every handoff in this file runs without a model for briefs, so the client has warned about it.
+    await engine.pollOnce()
+    await (runner as unknown as { syncRelay(): Promise<number> }).syncRelay()
+    const log = readFileSync(join(root, "state", "client-diagnostics.log"), "utf8")
+    expect(log).toMatch(/opencode-handoff\/\d+\.\d+\.\d+/)
+    expect(log).toContain("couldn't write a brief")
+    const host = new shared.HostClient({ url: url!, token: hostToken })
+    const device = JSON.parse(readFileSync(join(root, "config", "device.json"), "utf8"))
+    expect((await host.devices()).find((d) => d.id === device.deviceId)?.client).toMatch(/^opencode-handoff\//)
+  }, 60_000)
+
+  it("carries on without material the client never sends, instead of waiting out the job", async () => {
+    fakeHooks.onLaunchMessage = (message) => {
+      const requests = message.match(/`([^`]*\/requests)\/<short-name>\.json`/)![1]!
+      writeFileSync(join(requests, "need.json"), JSON.stringify({ inputs: [{ name: "recorder", ref: "feature/recorder", paths: ["recorder"], reason: "existing app" }] }))
+    }
+    const r = runner as unknown as { inputWaitMs: number }
+    const before = r.inputWaitMs
+    r.inputWaitMs = 50
+    try {
+      writeFileSync(join(work, "silent.txt"), "x\n")
+      await engine.handle("ses_silent", "/handoff build on the recorder")
+      // Only the host runs: the client never answers the request (offline, or an older plugin).
+      await runner.runOnce()
+    } finally {
+      r.inputWaitMs = before
+      fakeHooks.onLaunchMessage = undefined
+    }
+    expect(fake.sends.at(-1)!.message).toMatch(/hasn't sent `recorder`/)
+    expect(fake.sends.at(-1)!.message).toMatch(/BLOCKED:/)
+    await engine.pollOnce()
+    expect(posted.some((p) => /No answer from this machine for `recorder`/.test(p.text))).toBe(true)
+    expect(posted.at(-1)!.text).toMatch(/## Handoff `\w+` finished/)
+  }, 60_000)
+
+  it("doesn't start a second job when the same session submits the same request twice", async () => {
+    writeFileSync(join(work, "twice.txt"), "x\n")
+    await engine.handle("ses_twice", "/handoff do it once")
+    await engine.handle("ses_twice", "/handoff do it once")
+    const state = JSON.parse(readFileSync(join(root, "state", "device-state.json"), "utf8"))
+    expect(Object.values(state.jobs).filter((j: any) => j.sessionID === "ses_twice")).toHaveLength(1)
+    await runTogether()
+  }, 60_000)
 })

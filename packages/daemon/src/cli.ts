@@ -95,7 +95,7 @@ async function main(): Promise<void> {
       for (const d of await relay(config).devices()) {
         const seen = d.lastSeenAt ? new Date(d.lastSeenAt).toLocaleString() : "never"
         const trust = pinned[d.id]?.publicKey === d.publicKey ? pinned[d.id]!.fingerprint : "NOT TRUSTED (not confirmed at pairing)"
-        console.log(`${d.id}  ${d.name}  ${trust}  paired ${new Date(d.createdAt).toLocaleDateString()}  last seen ${seen}`)
+        console.log(`${d.id}  ${d.name}  ${trust}  paired ${new Date(d.createdAt).toLocaleDateString()}  last seen ${seen}  ${d.client ?? "client version unknown"}`)
       }
       break
     }
@@ -195,6 +195,9 @@ async function main(): Promise<void> {
     }
     case "run": {
       const runner = new Runner(await loadConfig())
+      // Under the installed launchd service (KeepAlive), exiting is how the daemon recovers from a stuck
+      // network. Run by hand there's nothing to restart it, so it keeps retrying instead.
+      runner.restartOnOutage = process.env.XPC_SERVICE_NAME === "dev.handoff.daemon"
       const shutdown = () => void runner.stop().then(() => process.exit(0))
       process.on("SIGTERM", shutdown)
       process.on("SIGINT", shutdown)

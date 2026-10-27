@@ -43,6 +43,13 @@ const OPEN_STATUSES: readonly JobStatus[] = ["uploading", "queued", "claimed", "
 /** Blob parts and downloads are larger; allow for slow links. */
 const BLOB_TIMEOUT_MS = 15 * 60_000
 
+/** "fetch failed" alone says nothing; the cause (DNS, refused, reset, timeout...) is what's useful in a log. */
+function describeNetworkError(err: unknown): string {
+  const e = err as Error & { cause?: { code?: string; message?: string } }
+  const cause = e.cause?.code ?? e.cause?.message
+  return cause && !e.message.includes(cause) ? `${e.message} (${cause})` : e.message
+}
+
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
 class BaseClient {
@@ -69,7 +76,7 @@ class BaseClient {
       try {
         res = await doFetch(this.base + path, { method, headers, body: payload, signal: AbortSignal.timeout(timeoutMs ?? this.opts.timeoutMs ?? DEFAULT_TIMEOUT_MS) })
       } catch (err) {
-        if (attempt >= retries) throw new RelayError(`network error: ${(err as Error).message}`, 0)
+        if (attempt >= retries) throw new RelayError(`network error: ${describeNetworkError(err)}`, 0)
         await sleep(Math.min(30_000, 500 * 2 ** attempt))
         continue
       }
@@ -169,6 +176,17 @@ export class DeviceClient extends BaseClient {
 
   async postEvent(jobId: string, kind: EventKind, payload: string): Promise<void> {
     await this.request("POST", "/v1/events", { jobId, kind, payload })
+  }
+
+  /** Report a client-side problem to the host (payload sealed by the caller). Older relays ignore it. */
+  async postDiagnostic(id: string, payload: string): Promise<boolean> {
+    try {
+      await this.request("POST", "/v1/diagnostics", { id, payload })
+      return true
+    } catch (err) {
+      if (err instanceof RelayError && (err.status === 404 || err.status === 429)) return false
+      throw err
+    }
   }
 }
 

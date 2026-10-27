@@ -86,6 +86,10 @@ export class Hub extends DurableObject<Env> {
           sender TEXT NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL, created_at INTEGER NOT NULL);
         CREATE INDEX IF NOT EXISTS events_device ON events(device_id, seq);
       `)
+      // Added after the first release; ALTER fails harmlessly once the column exists.
+      try {
+        this.sql.exec("ALTER TABLE devices ADD COLUMN client TEXT")
+      } catch {}
       if ((await ctx.storage.getAlarm()) === null) await ctx.storage.setAlarm(Date.now() + 60 * 60 * 1000)
     })
   }
@@ -163,8 +167,8 @@ export class Hub extends DurableObject<Env> {
 
   devices(): DeviceInfo[] {
     return this.sql
-      .exec<{ id: string; name: string; public_key: string; created_at: number; last_seen_at: number | null }>(
-        "SELECT id, name, public_key, created_at, last_seen_at FROM devices WHERE revoked_at IS NULL ORDER BY created_at",
+      .exec<{ id: string; name: string; public_key: string; created_at: number; last_seen_at: number | null; client: string | null }>(
+        "SELECT id, name, public_key, created_at, last_seen_at, client FROM devices WHERE revoked_at IS NULL ORDER BY created_at",
       )
       .toArray()
       .map((r) => ({
@@ -173,6 +177,7 @@ export class Hub extends DurableObject<Env> {
         publicKey: r.public_key,
         createdAt: r.created_at,
         ...(r.last_seen_at ? { lastSeenAt: r.last_seen_at } : {}),
+        ...(r.client ? { client: r.client } : {}),
       }))
   }
 
@@ -240,15 +245,29 @@ export class Hub extends DurableObject<Env> {
    * One round trip for a polling client: authenticate, new events, and its open jobs.
    * Returns null for a bad token. Each separate call would be its own Durable Object request.
    */
-  async deviceSync(token: string, after: number): Promise<{ events: RelayEvent[]; cursor: number; jobs: JobRecord[] } | null> {
+  async deviceSync(token: string, after: number, client?: string): Promise<{ events: RelayEvent[]; cursor: number; jobs: JobRecord[] } | null> {
     const principal = await this.authenticate(token)
     if (principal?.role !== "device") return null
+    // Which plugin version each client runs, so the host can tell when one is out of date.
+    if (client) this.sql.exec("UPDATE devices SET client = ? WHERE id = ? AND (client IS NULL OR client != ?)", client.slice(0, 80), principal.deviceId, client.slice(0, 80))
     return { ...this.events(principal, after), jobs: this.openJobs(principal.deviceId) }
   }
 
   /** One round trip for the host daemon: new device events and queued jobs. */
   hostSync(after: number): { events: RelayEvent[]; cursor: number; queued: JobRecord[] } {
     return { ...this.events({ role: "host" }, after), queued: this.listJobs({ role: "host" }, "queued") }
+  }
+
+  /** A sealed problem report from a client, delivered to the host as a device event. */
+  postDiagnostic(principal: Principal, id: string, payload: string): void {
+    if (principal.role !== "device") throw new HttpError(403, "devices only")
+    if (!/^[0-9A-HJKMNP-TV-Z]{26}$/.test(id)) throw new HttpError(400, "id must be a ULID")
+    if (payload.length > 32 * 1024) throw new HttpError(413, "diagnostic too large")
+    const recent = this.sql
+      .exec<{ n: number }>("SELECT COUNT(*) AS n FROM events WHERE device_id = ? AND kind = 'diag' AND created_at > ?", principal.deviceId, Date.now() - 60 * 60 * 1000)
+      .toArray()[0]!.n
+    if (recent >= 30) throw new HttpError(429, "too many diagnostics")
+    this.appendEvent(id, principal.deviceId, "device", "diag", payload)
   }
 
   private openJobs(deviceId: string): JobRecord[] {
@@ -482,6 +501,7 @@ export class Hub extends DurableObject<Env> {
       this.sql.exec("DELETE FROM events WHERE job_id = ?", id)
       this.sql.exec("DELETE FROM jobs WHERE id = ?", id)
     }
+    this.sql.exec("DELETE FROM events WHERE kind = 'diag' AND created_at < ?", cutoff)
     this.sql.exec("DELETE FROM pairings WHERE expires_at < ?", Date.now())
     this.sql.exec("DELETE FROM tickets WHERE expires_at < ?", Date.now())
     await this.ctx.storage.setAlarm(Date.now() + 6 * 60 * 60 * 1000)

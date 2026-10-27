@@ -36,6 +36,7 @@ export type EventKind =
   | "cancel" // device -> host: stop the job
   | "error" // host -> device: failure details
   | "result" // host -> device: result blob is ready
+  | "diag" // device -> host: a problem the client ran into (not tied to a job)
 
 export interface RelayEvent {
   seq: number
@@ -55,6 +56,17 @@ export interface DeviceInfo {
   publicKey: string
   createdAt: number
   lastSeenAt?: number
+  /** Client software the device last reported, e.g. "opencode-handoff/0.7.0". */
+  client?: string
+}
+
+/** A client-side problem reported to the host (encrypted like an event). */
+export interface DiagnosticPayload {
+  client: string
+  message: string
+  jobId?: string
+  sessionId?: string
+  at: number
 }
 
 // ---------- Encrypted payloads ----------

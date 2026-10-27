@@ -23,6 +23,7 @@ import {
   seal,
   sealContext,
   sealJson,
+  type DiagnosticPayload,
   ulid,
   unpackContainer,
   type DeliveryNotice,
@@ -43,6 +44,7 @@ import {
 import { slugify } from "@handoff/shared/git"
 import { condenseTranscript } from "@handoff/shared/transcript"
 import { briefPrompt, parseBrief } from "./brief.js"
+import { PLUGIN_VERSION } from "./version.js"
 import { packInputs, reviewInputs, type ReviewedInput } from "./inputs.js"
 import { summarizeSkipped } from "./secrets.js"
 import { adoptSnapshot, applyResult, createBundle, deleteRef, repoTop, takeSnapshot, type ApplyOutcome } from "./repo.js"
@@ -65,6 +67,8 @@ import {
 } from "./store.js"
 
 export interface Opencode {
+  /** Client software reported to the host, e.g. "opencode-handoff/0.7.0". */
+  client?: string
   /** Name of the app the user talks to, for messages (default "opencode"). */
   readonly app?: string
   /** The session's agent has the handoff tools (handoff, handoff_send, handoff_status). */
@@ -97,6 +101,16 @@ const POLL_STUCK_MS = 20 * 60_000
 
 const short = (id: string) => id.slice(-6).toLowerCase()
 
+/**
+ * Problems this client ran into, waiting to be reported to the host (shared by every engine in the
+ * process). The host logs them, so a failure here can be diagnosed without access to this machine.
+ */
+const pendingProblems: Array<{ message: string; jobId?: string; sessionId?: string; at: number }> = []
+const reportedRecently = new Map<string, number>()
+const MAX_PENDING_PROBLEMS = 20
+/** A second identical handoff from the same session within this window returns the first. */
+const DUPLICATE_WINDOW_MS = 2 * 60 * 1000
+
 export class Engine {
   private readonly owner = `${process.pid}-${Math.random().toString(36).slice(2)}`
   private timer: ReturnType<typeof setTimeout> | null = null
@@ -110,10 +124,37 @@ export class Engine {
 
   constructor(private readonly opencode: Opencode) {}
 
+  private get clientName(): string {
+    return this.opencode.client ?? `opencode-handoff/${PLUGIN_VERSION}`
+  }
+
+  /** Log a problem here and queue it for the host. The same message is reported at most once an hour. */
+  private warn(message: string, job?: { id: string; sessionID?: string }): void {
+    this.opencode.log(`handoff: ${message}`)
+    const key = message.replace(/\b[0-9A-HJKMNP-TV-Z]{26}\b/g, "<id>").slice(0, 200)
+    if (Date.now() - (reportedRecently.get(key) ?? 0) < 60 * 60 * 1000) return
+    reportedRecently.set(key, Date.now())
+    if (pendingProblems.length >= MAX_PENDING_PROBLEMS) pendingProblems.shift()
+    pendingProblems.push({ message, ...(job ? { jobId: job.id } : {}), ...(job?.sessionID ? { sessionId: job.sessionID } : {}), at: Date.now() })
+  }
+
+  /** Send queued problems to the host, sealed to its pinned key. Keeps them if the relay is unreachable. */
+  private async reportProblems(config: DeviceConfig, relay: DeviceClient): Promise<void> {
+    while (pendingProblems.length) {
+      const p = pendingProblems[0]!
+      const id = ulid()
+      const payload: DiagnosticPayload = { client: this.clientName, ...p }
+      const sealed = await sealJson(payload, config.hostPublicKey, config.keys, sealContext.event("diag", id))
+      await relay.postDiagnostic(id, sealed)
+      pendingProblems.shift()
+    }
+  }
+
   private async client(): Promise<{ config: DeviceConfig; relay: DeviceClient }> {
     const config = await loadConfig()
     if (!config) throw new Error("This machine is not paired. On the host run `handoff-daemon pair`, then `/handoff pair <url> <code>` here.")
-    return { config, relay: new DeviceClient({ url: config.relayUrl, token: config.token, ...(config.headers ? { headers: config.headers } : {}) }) }
+    const headers = { ...config.headers, "x-handoff-client": this.clientName }
+    return { config, relay: new DeviceClient({ url: config.relayUrl, token: config.token, headers }) }
   }
 
   // ---------- commands ----------
@@ -180,6 +221,17 @@ export class Engine {
   }
 
   async submit(sessionID: string, instructions: string, options: SubmitOptions = {}, retryOf?: DeviceJob): Promise<DeviceJob> {
+    if (!retryOf) {
+      // The same request twice in a row (an agent calling the tool again, a double submit) would start two
+      // host jobs racing on one thread. Return the one already under way instead.
+      const same = Object.values((await loadState()).jobs).find(
+        (j) => j.sessionID === sessionID && j.instructions === instructions && !["failed", "cancelled", "applied"].includes(j.phase) && Date.now() - j.createdAt < DUPLICATE_WINDOW_MS,
+      )
+      if (same) {
+        this.opencode.log(`handoff: ${short(same.id)} is already handing this off; not starting another`)
+        return same
+      }
+    }
     const { config, relay } = await this.client()
     const settings = await loadSettings()
     const model = options.model ?? settings.model
@@ -226,7 +278,7 @@ export class Engine {
       try {
         transcript = condenseTranscript(await this.opencode.exportSession(sessionID), settings.transcriptChars)
       } catch (err) {
-        this.opencode.log(`handoff: session export failed: ${(err as Error).message}`)
+        this.warn(`session export failed: ${(err as Error).message}`)
       }
       const repoName = top.split("/").pop() || "repo"
       const brief = options.brief ?? retryOf?.brief ?? (settings.brief && !retryOf && !options.skipBrief ? await this.writeBrief(sessionID, instructions, repoName) : undefined)
@@ -275,6 +327,7 @@ export class Engine {
       await updateJob(id, { phase: "submitted", lastStatus: "queued for the host" })
     } catch (err) {
       await updateJob(id, { phase: "failed", lastStatus: (err as Error).message })
+      this.warn(`handoff failed before reaching the host: ${(err as Error).message}`, { id, sessionID })
       throw err
     }
     if (asks.length) {
@@ -476,7 +529,7 @@ export class Engine {
       if (req) Object.assign(req, { state: "received", detail: `the host received ${header.imported.length ? header.imported.map((n) => `\`${n}\``).join(", ") : "the reply"}` })
       delete s.deliveries?.[deliveryId]
     })
-    await relay.ack(deliveryId).catch((err) => this.opencode.log(`handoff: ack failed: ${(err as Error).message}`))
+    await relay.ack(deliveryId).catch((err) => this.warn(`ack failed: ${(err as Error).message}`))
   }
 
   private async deliveryFailed(deliveryId: string, message: string): Promise<void> {
@@ -499,12 +552,12 @@ export class Engine {
         const text = await withTimeout(this.opencode.generate(sessionID, briefPrompt(instructions, repoName)), BRIEF_TIMEOUT_MS)
         const brief = parseBrief(text)
         if (brief) return brief
-        this.opencode.log(`handoff: the model's brief wasn't usable (attempt ${attempt}): ${JSON.stringify(text.slice(0, 300))}`)
+        this.warn(`the model's brief wasn't usable (attempt ${attempt}): ${JSON.stringify(text.slice(0, 300))}`)
       } catch (err) {
-        this.opencode.log(`handoff: couldn't write a brief (attempt ${attempt}): ${(err as Error).message}`)
+        this.warn(`couldn't write a brief (attempt ${attempt}): ${(err as Error).message}`)
       }
     }
-    this.opencode.log("handoff: sending the request as typed")
+    this.warn("sending the request as typed (no brief)")
     return undefined
   }
 
@@ -625,7 +678,7 @@ export class Engine {
         next = recent ? CONVERSATION_POLL_MS : IDLE_POLL_MS
       }
     } catch (err) {
-      this.opencode.log(`handoff: poll failed: ${(err as Error).message}`)
+      this.warn(`poll failed: ${(err as Error).message}`)
       next = 60_000
     }
     this.schedule(next)
@@ -636,7 +689,7 @@ export class Engine {
     if (this.polling) {
       if (Date.now() - this.pollStartedAt < POLL_STUCK_MS) return true
       // A pass that never finished (e.g. a call into opencode that never returned) must not stop polling for good.
-      this.opencode.log(`handoff: previous poll still running after ${Math.round((Date.now() - this.pollStartedAt) / 60_000)} minutes; starting a new one`)
+      this.warn(`previous poll still running after ${Math.round((Date.now() - this.pollStartedAt) / 60_000)} minutes; starting a new one`)
     }
     const pass = ++this.pollPass
     this.polling = true
@@ -663,7 +716,7 @@ export class Engine {
           try {
             await this.handleEvent(config, relay, ev)
           } catch (err) {
-            this.opencode.log(`handoff: event ${ev.seq} for job ${ev.jobId} failed: ${(err as Error).message}`)
+            this.warn(`event ${ev.seq} for job ${ev.jobId} failed: ${(err as Error).message}`)
           }
         }
         if (next === cursor) break
@@ -676,10 +729,12 @@ export class Engine {
       for (const job of Object.values((await loadState()).jobs).filter((j) => j.phase === "submitted")) {
         for (const req of (job.inputRequests ?? []).filter((r) => r.state === "sending" || r.state === "failed")) {
           await this.sendInputs(config, relay, job, req, await reviewInputs(req.inputs, job.repoTop), req.approved ?? false, req.refuseReason).catch((err: unknown) =>
-            this.opencode.log(`handoff: resending material for ${job.id} failed: ${(err as Error).message}`),
+            this.warn(`resending material for ${job.id} failed: ${(err as Error).message}`),
           )
         }
       }
+
+      await this.reportProblems(config, relay).catch((err: unknown) => this.opencode.log(`handoff: couldn't report problems to the host: ${(err as Error).message}`))
 
       // Safety net for missed events: reconcile in-flight jobs with their relay status. Jobs missing
       // from the open list have ended (cancelled, failed or gone); only those need a lookup.
@@ -699,12 +754,12 @@ export class Engine {
       const { jobs: known, deliveries = {} } = await loadState()
       for (const remote of open.filter((j) => j.status === "done" && !known[j.id] && !this.unclaimable.has(j.id))) {
         if (deliveries[remote.id]) {
-          await this.confirmDelivery(config, relay, remote.id).catch((err: unknown) => this.opencode.log(`handoff: delivery ${remote.id}: ${(err as Error).message}`))
+          await this.confirmDelivery(config, relay, remote.id).catch((err: unknown) => this.warn(`delivery ${remote.id}: ${(err as Error).message}`))
           continue
         }
         await this.receiveUpdate(config, relay, remote.id).catch((err: unknown) => {
           if (!(err instanceof RelayError)) this.unclaimable.add(remote.id)
-          this.opencode.log(`handoff: update ${remote.id} failed: ${(err as Error).message}`)
+          this.warn(`update ${remote.id} failed: ${(err as Error).message}`)
         })
       }
       return Object.values((await loadState()).jobs).some((j) => ["uploading", "submitted", "applying"].includes(j.phase))
@@ -717,7 +772,7 @@ export class Engine {
     // The sealed blob isn't persisted; abandon and resubmit from the saved snapshot ref.
     await updateJob(job.id, { phase: "failed", lastStatus: "upload interrupted; resubmitted" })
     await this.submit(job.sessionID, job.instructions, jobOptions(job), job).catch((err) =>
-      this.opencode.log(`handoff: resubmit failed: ${(err as Error).message}`),
+      this.warn(`resubmit failed: ${(err as Error).message}`),
     )
   }
 
@@ -835,7 +890,7 @@ export class Engine {
     const settings = await loadSettings()
     const next = { resume: settings.resume, tools: this.opencode.tools ?? false, rounds, maxRounds: settings.autoFollowUps }
     await this.postToSession(job, resultMessage(job, result, outcome, next, this.opencode.app ?? "opencode"), settings.resume)
-    await relay.ack(jobId).catch((err) => this.opencode.log(`handoff: ack failed: ${(err as Error).message}`))
+    await relay.ack(jobId).catch((err) => this.warn(`ack failed: ${(err as Error).message}`))
   }
 
   /**

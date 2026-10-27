@@ -2,7 +2,7 @@
 // -> bundle agent commits -> encrypt -> upload. Each step is checkpointed in the
 // local state file so a daemon restart (or host reboot) resumes where it left off.
 
-import { mkdir, readdir, rename, rm, stat, writeFile, readFile } from "node:fs/promises"
+import { appendFile, mkdir, readdir, rename, rm, stat, writeFile, readFile } from "node:fs/promises"
 import { join } from "node:path"
 import {
   PROTOCOL_VERSION,
@@ -21,6 +21,7 @@ import {
   utf8,
   type EventKind,
   type ModelSelection,
+  type DiagnosticPayload,
   type ErrorPayload,
   type DeliveryNotice,
   type InputRequestPayload,
@@ -36,7 +37,7 @@ import {
   type StatusPayload,
 } from "@handoff/shared"
 import { git, gitOk, revParse, commitList, slugify, GitError } from "@handoff/shared/git"
-import { STATE_PATH, loadConfig, loadDevices, readJson, writeJsonAtomic, type DaemonConfig } from "./config.js"
+import { STATE_DIR, STATE_PATH, loadConfig, loadDevices, readJson, writeJsonAtomic, type DaemonConfig } from "./config.js"
 import { ACTIVE_STATUSES, T3, T3AuthError } from "./t3.js"
 
 /** The subset of the T3 client the runner uses (lets tests substitute a fake). */
@@ -152,6 +153,10 @@ const EMPTY_STATE = (): State => ({ eventCursor: 0, jobs: {}, conversations: {},
 const CONVERSATION_TTL_MS = 14 * 24 * 60 * 60 * 1000
 /** With the relay socket connected, poll the relay this often anyway in case a notification was lost. */
 const RELAY_SAFETY_POLL_MS = 5 * 60 * 1000
+/** How long the agent waits for material it asked the user's machine for before carrying on without it. */
+const INPUT_WAIT_MS = 15 * 60 * 1000
+/** Restart (via launchd) after the relay has been unreachable this long. */
+const RELAY_RESTART_AFTER_MS = 20 * 60 * 1000
 
 const log = (...args: unknown[]) => console.log(new Date().toISOString(), ...args)
 
@@ -163,6 +168,8 @@ export class Runner {
   private stopping = false
   private wake: (() => void) | null = null
   private socketOpen = false
+  /** Exit for a restart after a long relay outage (the installed service; off in tests and `run --once`). */
+  restartOnOutage = false
   private syncRequested = false
 
   private requestSync(): void {
@@ -172,6 +179,8 @@ export class Runner {
   private replies = new Map<string, ReplyPayload[]>()
   /** How long a thread must stay idle, with no subagents working, before its result is collected. */
   settleMs = 20_000
+  /** How long the agent waits for material from the client before carrying on without it. */
+  inputWaitMs = INPUT_WAIT_MS
   private cancels = new Set<string>()
 
   constructor(
@@ -219,6 +228,7 @@ export class Runner {
     }
 
     let lastSync = 0
+    let lastRelayOk = Date.now()
     while (!this.stopping) {
       try {
         // The socket says when a job is queued or a client posts an event, so the relay is only
@@ -227,10 +237,18 @@ export class Runner {
           this.syncRequested = false
           lastSync = Date.now()
           await this.syncRelay()
+          lastRelayOk = Date.now()
         }
         await this.pollConversations()
       } catch (err) {
         log("poll error:", (err as Error).message)
+        if (Date.now() - lastRelayOk > RELAY_RESTART_AFTER_MS && this.restartOnOutage) {
+          // A long-running process can lose its network stack (sleep, network changes) while new
+          // processes connect fine. launchd restarts the daemon; jobs resume from their checkpoints.
+          log(`relay unreachable for ${Math.round((Date.now() - lastRelayOk) / 60_000)} minutes; restarting the daemon`)
+          await this.t3.close().catch(() => {})
+          process.exit(75)
+        }
       }
       await new Promise<void>((resolve) => {
         const timer = setTimeout(resolve, 30_000)
@@ -326,6 +344,7 @@ export class Runner {
   }
 
   private async handleEvent(ev: RelayEvent): Promise<void> {
+    if (ev.kind === "diag") return this.recordDiagnostic(ev)
     if (!this.state.jobs[ev.jobId]) return
     try {
       await this.applyEvent(ev)
@@ -339,6 +358,20 @@ export class Runner {
     const device = (await loadDevices())[deviceId]
     if (!device) throw Object.assign(new Error(`device ${deviceId} is not paired with this host`), { code: "unpaired_device" })
     return device.publicKey
+  }
+
+  /** A problem a client ran into, reported so it can be diagnosed from this machine. */
+  private async recordDiagnostic(ev: RelayEvent): Promise<void> {
+    if (ev.from !== "device") return
+    try {
+      const d = await this.openEvent<DiagnosticPayload>(ev)
+      const device = (await loadDevices())[ev.deviceId]?.name ?? ev.deviceId
+      const line = `${new Date(d.at).toISOString()} ${device} ${d.client}${d.jobId ? ` job ${d.jobId}` : ""}: ${d.message.replace(/\s+/g, " ").slice(0, 2000)}`
+      log(`client problem: ${line}`)
+      await appendFile(join(STATE_DIR, "client-diagnostics.log"), `${line}\n`, { mode: 0o600 })
+    } catch (err) {
+      log(`unreadable client diagnostic ${ev.seq}:`, (err as Error).message)
+    }
   }
 
   private async openEvent<T>(ev: RelayEvent): Promise<T> {
@@ -897,6 +930,20 @@ export class Runner {
         } else if (awaited.length || job.expectedDeliveries?.length) {
           idleSince = null
           const names = awaited.length ? awaited.join(", ") : "inputs"
+          const stale = (job.inputRequests ?? []).filter((r) => r.sent && !r.answered && Date.now() - r.at >= this.inputWaitMs)
+          if (stale.length && !job.expectedDeliveries?.length) {
+            // The user's machine never answered (offline, an older plugin, or waiting on someone's approval).
+            // Don't hold the thread for the job's whole timeout: let the agent finish without it or say it's blocked.
+            const missing = stale.flatMap((r) => r.inputs.map((i) => `\`${i.name}\``)).join(", ")
+            const note = `The user's machine hasn't sent ${missing} after ${Math.max(1, Math.round(this.inputWaitMs / 60_000))} minutes. Don't wait for it: finish what you can without it, commit, and if the task can't be completed, end your final message with a line starting \`BLOCKED:\` that says exactly what's needed.`
+            await this.update(job, {
+              inputRequests: (job.inputRequests ?? []).map((r) => (stale.includes(r) ? { ...r, answered: true } : r)),
+              notes: [...(job.notes ?? []), note],
+            })
+            await this.notify(job, `No answer from this machine for ${missing}; the agent will continue without it`, true)
+            waitingOn = ""
+            continue
+          }
           if (`inputs:${names}` !== waitingOn) await this.notify(job, `Waiting for the user's machine to send: ${names}`)
           waitingOn = `inputs:${names}`
         } else if (idleSince === null) {

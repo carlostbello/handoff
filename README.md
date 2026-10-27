@@ -101,6 +101,9 @@ In Kilo, which has no tools for plugins, you get the same requests, approvals an
 | Daemon or host restarts mid-job | Every step is checkpointed. T3 threads are matched by job id, so a restart never creates duplicate threads. |
 | Host lost its repository mirror | The incremental bundle fails, and the plugin resends a full bundle automatically. |
 | T3 login expired (about 30 days) | The job pauses and retries every 5 minutes. Run `handoff-daemon login`. |
+| Host can't reach the relay for 20 minutes | The installed daemon restarts itself, and jobs resume from their checkpoints. |
+| The host agent asks for material the client never sends | After 15 minutes the agent is told to finish without it, or end with a `BLOCKED:` line saying what's missing. You get a notice, instead of a job that waits out its timeout. |
+| Something fails on the client | The plugin reports it, encrypted, to the host. The host writes it to `~/.local/state/handoff/client-diagnostics.log`, so client problems can be diagnosed on the host. |
 
 ## Requirements
 
@@ -231,7 +234,7 @@ In the opencode TUI you can also see progress without asking:
 
 The TUI reads this from the plugin's local state file, so it adds no relay traffic.
 
-On the host: `handoff-daemon status | config | models | devices | revoke <deviceId> | pair | run | install | uninstall`.
+On the host: `handoff-daemon status | config | models | devices | revoke <deviceId> | pair | run | install | uninstall`. `handoff-daemon devices` also shows each client's plugin version.
 
 ## Choosing models
 

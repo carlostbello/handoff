@@ -7,6 +7,7 @@ import type { KiloClient, TextPartInput } from "@kilocode/sdk/client"
 import { condenseTranscript } from "@handoff/shared/transcript"
 import { NOTICE, type Opencode } from "@handoff/opencode-plugin/engine"
 import { loadState } from "@handoff/opencode-plugin/store"
+import { PLUGIN_VERSION } from "@handoff/opencode-plugin/version"
 import { toExport } from "./transcript.js"
 
 /** Transcript the brief-writing model sees; the session's own model writes the brief from it. */
@@ -43,6 +44,7 @@ export function kiloOpencode(client: KiloClient): Opencode {
   }
 
   return {
+    client: `kilo-handoff/${PLUGIN_VERSION}`,
     app: "Kilo",
     async sessionDirectory(sessionID) {
       return (await session(sessionID)).directory

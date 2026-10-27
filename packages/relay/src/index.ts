@@ -99,7 +99,7 @@ async function route(request: Request, env: Env): Promise<Response> {
   const token = request.headers.get("authorization")?.replace(/^Bearer\s+/i, "") ?? ""
   // A client's poll authenticates and reads in one Durable Object request.
   if (method === "GET" && path === "/v1/sync") {
-    const res = await hub.deviceSync(token, Number(url.searchParams.get("after") ?? 0))
+    const res = await hub.deviceSync(token, Number(url.searchParams.get("after") ?? 0), request.headers.get("x-handoff-client") ?? undefined)
     if (!res) throw new HttpError(401, "unauthorized")
     return json(res)
   }
@@ -135,6 +135,11 @@ async function route(request: Request, env: Env): Promise<Response> {
     }
     if (method === "GET" && path === "/v1/events") {
       return json(await hub.events(principal, Number(url.searchParams.get("after") ?? 0)))
+    }
+    if (method === "POST" && path === "/v1/diagnostics") {
+      const { id, payload } = await body<{ id: string; payload: string }>(request)
+      await hub.postDiagnostic(principal, id, payload ?? "")
+      return json({ ok: true })
     }
     if (method === "POST" && path === "/v1/events") {
       const ev = await body<PostEventRequest>(request)

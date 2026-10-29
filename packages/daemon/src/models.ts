@@ -66,6 +66,8 @@ export interface ResolvedModels {
   subagents: ModelChoice[]
   /** Models the request mentioned (other than as the lead), in order. */
   mentioned: ModelChoice[]
+  /** Models the request names that T3 offers but this host doesn't allow. */
+  notAllowed?: ModelChoice[]
 }
 
 export interface ModelPolicy {
@@ -75,7 +77,7 @@ export interface ModelPolicy {
   aliases: Record<string, string>
 }
 
-export function resolveModels(policy: ModelPolicy, instructions: string, flag?: string): ResolvedModels {
+export function resolveModels(policy: ModelPolicy, instructions: string, flag?: string, catalog: ModelSelection[] = []): ResolvedModels {
   const leadSet = dedupe([...(policy.model ? [policy.model] : []), ...policy.leadModels])
   const all = dedupe([...leadSet, ...policy.subagentModels])
   const isLead = (s: ModelSelection) => leadSet.some((l) => sameModel(l, s))
@@ -139,7 +141,26 @@ export function resolveModels(policy: ModelPolicy, instructions: string, flag?: 
   }
   // Mentioned models are usable as subagents even if only allowed as leads; the rest of the subagent list follows.
   const subagents = [...mentioned, ...policy.subagentModels.filter((s) => !mentioned.some((m) => sameModel(m.selection, s))).map((s) => ({ selection: s, mentionedAs: [] }))]
-  return { lead, leadSource, subagents, mentioned }
+
+  // Names of models T3 has but this host doesn't allow ("use luna subagents" with luna off the list):
+  // report them instead of letting the agent quietly pick something else.
+  const notAllowed: ModelChoice[] = []
+  const others = new Map<string, ModelSelection>()
+  for (const s of catalog.filter((c) => !all.some((a) => sameModel(a, c))))
+    for (const alias of deriveAliases(s)) if (!table.has(alias) && !others.has(alias)) others.set(alias, s)
+  for (const [alias, selection] of [...others].sort((a, b) => b[0].length - a[0].length)) {
+    const re = new RegExp(`(?<![a-z0-9.])${alias.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![a-z0-9])`, "g")
+    for (const m of text.matchAll(re)) {
+      const start = m.index!
+      const end = start + alias.length
+      if (taken.some(([s, e]) => start < e && end > s)) continue
+      taken.push([start, end])
+      const existing = notAllowed.find((n) => sameModel(n.selection, selection))
+      if (existing) existing.mentionedAs.includes(alias) || existing.mentionedAs.push(alias)
+      else notAllowed.push({ selection, mentionedAs: [alias] })
+    }
+  }
+  return { lead, leadSource, subagents, mentioned, ...(notAllowed.length ? { notAllowed } : {}) }
 }
 
 function clauseAt(text: string, index: number): string {
@@ -165,5 +186,9 @@ export function describeResolution(r: ResolvedModels): string {
   const lead = r.lead ? formatModelSpec(r.lead) : "T3's project default"
   const how = r.leadSource === "request" ? " (named in your request)" : r.leadSource === "flag" ? " (--model)" : " (host default)"
   const mentioned = r.mentioned.map((m) => `${m.mentionedAs[0]} → ${formatModelSpec(m.selection)}`)
-  return `Lead model: ${lead}${how}.${mentioned.length ? ` Models named for steps: ${mentioned.join(", ")}.` : ""}`
+  const blocked = (r.notAllowed ?? []).map((m) => `${m.mentionedAs[0]} (${formatModelSpec(m.selection)})`)
+  const fix = (r.notAllowed ?? []).map((m) => `\`handoff-daemon config add subagentModels ${formatModelSpec(m.selection)}\``)
+  return `Lead model: ${lead}${how}.${mentioned.length ? ` Models named for steps: ${mentioned.join(", ")}.` : ""}${
+    blocked.length ? ` Not allowed on this host, so the agent will use a listed model instead: ${blocked.join(", ")}. To allow it, run on the host: ${fix.join(", ")}.` : ""
+  }`
 }

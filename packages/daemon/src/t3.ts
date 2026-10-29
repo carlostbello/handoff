@@ -400,6 +400,12 @@ export class T3 {
     await this.pendingRequest("respond", { threadId, requestId, answers })
   }
 
+  /** Every model T3 currently offers, as provider instance + model id. */
+  async catalog(): Promise<Array<{ instanceId: string; model: string }>> {
+    const { providers } = await this.call<{ providers: Array<{ providerInstanceId: string; models?: Array<{ id: string }> }> }>("orchestrator_capabilities", {})
+    return providers.flatMap((p) => (p.models ?? []).map((m) => ({ instanceId: p.providerInstanceId, model: m.id })))
+  }
+
   /** Switch a thread's model for its next run. */
   async configure(threadId: string, modelSelection: Record<string, unknown>): Promise<void> {
     await this.call("t3_thread_configure", { threadId, modelSelection })

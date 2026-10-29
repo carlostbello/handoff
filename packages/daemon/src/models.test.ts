@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
 import { parseModelSpec } from "@handoff/shared"
-import { deriveAliases, displayAliases, resolveModels, type ModelPolicy } from "./models.js"
+import { deriveAliases, describeResolution, displayAliases, resolveModels, type ModelPolicy } from "./models.js"
 
 const m = parseModelSpec
 const policy: ModelPolicy = {
@@ -58,5 +58,16 @@ describe("model mentions", () => {
     expect(resolveModels(policy, "x", "claudeAgent/claude-opus-5-5:effort=high").lead?.options).toEqual({ effort: "high" })
     expect(() => resolveModels(policy, "x", "fable")).toThrow(/isn't allowed as the lead/)
     expect(() => resolveModels(policy, "x", "codex/gpt-9")).toThrow(/isn't allowed/)
+  })
+
+  it("reports a model T3 offers but the host doesn't allow, instead of ignoring it", () => {
+    const catalog = [m("codex/gpt-6-astra"), m("codex/gpt-6-luna"), m("claudeAgent/claude-opus-5-5")]
+    const r = resolveModels(policy, "use Opus to judge it, and use Luna subagents to research it", undefined, catalog)
+    expect(r.lead?.model).toBe("claude-opus-5-5")
+    expect(r.notAllowed).toEqual([{ selection: m("codex/gpt-6-luna"), mentionedAs: ["luna"] }])
+    expect(describeResolution(r)).toMatch(/Not allowed on this host.*luna \(codex\/gpt-6-luna\).*config add subagentModels codex\/gpt-6-luna/)
+    // Allowed models and words that aren't models are not reported.
+    expect(resolveModels(policy, "have astra review it", undefined, catalog).notAllowed).toBeUndefined()
+    expect(resolveModels({ ...policy, subagentModels: [...policy.subagentModels, m("codex/gpt-6-luna")] }, "use luna subagents", undefined, catalog).mentioned[0]?.selection.model).toBe("gpt-6-luna")
   })
 })

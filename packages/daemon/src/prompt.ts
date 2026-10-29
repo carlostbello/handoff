@@ -182,6 +182,7 @@ If you still can't proceed, end your final message with a line \`BLOCKED: <exact
 
 function modelSection(models: ResolvedModels): string {
   if (!models.subagents.length) return ""
+  const refused = (models.notAllowed ?? []).map((m) => `"${m.mentionedAs[0]}" (${formatModelSpec(m.selection)})`)
   const target = (m: ResolvedModels["subagents"][number]) => {
     const opts = Object.entries(m.selection.options ?? {})
     const json = `providerInstanceId "${m.selection.instanceId}", model "${m.selection.model}"${opts.length ? `, options ${JSON.stringify(Object.fromEntries(opts))}` : ""}`
@@ -195,7 +196,11 @@ ${
     ? "- The task names models for particular steps. Run each of those steps with the model named for it, via delegate_task, and wait for the result before moving on.\n"
     : ""
 }- Subagents that change code must share your checkout (the default isolation), so their work lands on your branch. Review what they did and commit it.
-- If the task asks for a model that isn't listed, don't substitute silently: use the closest listed one and say so in your final message.
+${
+  refused.length
+    ? `- The user asked for ${refused.join(", ")}, which this host doesn't allow. Use the closest listed model for those steps instead, and say in your final message which one you used.`
+    : "- If the task asks for a model that isn't listed, don't substitute silently: use the closest listed one and say so in your final message."
+}
 
 `
 }

@@ -59,7 +59,8 @@ export type T3Like = Pick<
   | "respond"
   | "interrupt"
   | "close"
->
+> &
+  Partial<Pick<T3, "catalog">>
 import { buildFollowUpPrompt, buildPrompt, type ContextFiles, type InputsContext } from "./prompt.js"
 import { describeResolution, resolveModels } from "./models.js"
 import { NOTE_PREFIX, combineNotes, deliveryNote, importInputs, parseBlocked, parseInputRequest, splitPayload, type ImportedInput } from "./inputs.js"
@@ -371,6 +372,20 @@ export class Runner {
       await appendFile(join(STATE_DIR, "client-diagnostics.log"), `${line}\n`, { mode: 0o600 })
     } catch (err) {
       log(`unreadable client diagnostic ${ev.seq}:`, (err as Error).message)
+    }
+  }
+
+  private catalog: { at: number; models: ModelSelection[] } | null = null
+
+  /** Every model T3 offers (to recognise names the host doesn't allow). Cached; empty if T3 can't say. */
+  private async modelCatalog(): Promise<ModelSelection[]> {
+    if (this.catalog && Date.now() - this.catalog.at < 10 * 60 * 1000) return this.catalog.models
+    try {
+      const models = (await this.t3.catalog?.()) ?? []
+      this.catalog = { at: Date.now(), models }
+      return models
+    } catch {
+      return this.catalog?.models ?? []
     }
   }
 
@@ -728,7 +743,7 @@ export class Runner {
 
     const project = await this.t3.ensureProject(repoDir, home.name)
     // Model choice: --model, else a model named in the request, else the host default; all within the allowed lists.
-    const models = resolveModels(this.config, manifest.instructions, manifest.options.model)
+    const models = resolveModels(this.config, manifest.instructions, manifest.options.model, await this.modelCatalog())
 
     // A follow-up from the same opencode session continues that session's thread.
     const conversationKey = `${job.deviceId}:${manifest.session.id}`

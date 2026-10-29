@@ -374,6 +374,20 @@ export class Runner {
     }
   }
 
+  /** The agent's open questions. Forwarding them is optional: if T3 can't list them, the job carries on. */
+  private async pendingQuestions(threadId: string): Promise<string[]> {
+    try {
+      return await this.t3.pendingRequests(threadId)
+    } catch (err) {
+      if (err instanceof T3AuthError) throw err
+      if (!this.questionsUnavailable) log(`can't check the agent's questions (continuing without): ${(err as Error).message}`)
+      this.questionsUnavailable = true
+      return []
+    }
+  }
+
+  private questionsUnavailable = false
+
   private async openEvent<T>(ev: RelayEvent): Promise<T> {
     return openJson<T>(ev.payload, this.config.keys, await this.deviceKey(ev.deviceId), sealContext.event(ev.kind, ev.jobId))
   }
@@ -966,7 +980,7 @@ export class Runner {
       }
 
       // Forward questions; deliver replies.
-      const pending = await this.t3.pendingRequests(threadId)
+      const pending = await this.pendingQuestions(threadId)
       const asked = new Set(job.askedRequests ?? [])
       for (const requestId of pending) {
         if (asked.has(requestId)) continue
@@ -984,7 +998,7 @@ export class Runner {
         if (pending.includes(reply.requestId)) await this.t3.respond(threadId, reply.requestId, reply.answers)
       }
       this.replies.delete(job.id)
-      if (needsInput && (await this.t3.pendingRequests(threadId)).length === 0) {
+      if (needsInput && (await this.pendingQuestions(threadId)).length === 0) {
         await this.relay.setStatus(job.id, "running")
         needsInput = false
       }

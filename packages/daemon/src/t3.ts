@@ -367,16 +367,37 @@ export class T3 {
     return text
   }
 
+  /**
+   * Pending questions. T3 merged t3_pending_request_list/_read/_respond into one t3_pending_request tool;
+   * use it, falling back to the old names on an older T3.
+   */
+  private async pendingRequest<T>(action: "list" | "read" | "respond", args: Record<string, unknown>): Promise<T> {
+    if (this.splitPendingTools !== true) {
+      try {
+        const res = await this.call<T>("t3_pending_request", { action, ...args })
+        this.splitPendingTools = false
+        return res
+      } catch (err) {
+        if (this.splitPendingTools === false || !isUnknownTool(err)) throw err
+        this.splitPendingTools = true
+      }
+    }
+    return this.call<T>(`t3_pending_request_${action}`, args)
+  }
+
+  /** Whether this T3 only has the older per-action pending-request tools (undefined: not known yet). */
+  private splitPendingTools: boolean | undefined
+
   async pendingRequests(threadId: string): Promise<string[]> {
-    return (await this.call<{ requestIds: string[] }>("t3_pending_request_list", { threadId })).requestIds ?? []
+    return (await this.pendingRequest<{ requestIds?: string[] }>("list", { threadId })).requestIds ?? []
   }
 
   async readPendingRequest(threadId: string, requestId: string): Promise<unknown> {
-    return this.call("t3_pending_request_read", { threadId, requestId })
+    return this.pendingRequest("read", { threadId, requestId })
   }
 
   async respond(threadId: string, requestId: string, answers: Record<string, unknown>): Promise<void> {
-    await this.call("t3_pending_request_respond", { threadId, requestId, answers })
+    await this.pendingRequest("respond", { threadId, requestId, answers })
   }
 
   /** Switch a thread's model for its next run. */
@@ -392,4 +413,9 @@ export class T3 {
   async interrupt(threadId: string, reason: string, clientRequestId: string): Promise<void> {
     await this.call("t3_thread_interrupt", { threadId, reason, clientRequestId })
   }
+}
+
+/** MCP's "tool not found" (T3 renamed or removed a tool). */
+export function isUnknownTool(err: unknown): boolean {
+  return /tool .* not found|unknown tool|-32602/i.test((err as Error)?.message ?? "")
 }

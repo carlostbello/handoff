@@ -4,13 +4,14 @@ import { T3, isUnknownTool } from "./t3.js"
 /** A T3 client whose MCP calls go to `tools` instead of a real server. */
 function fakeT3(tools: Record<string, (args: Record<string, unknown>) => unknown>) {
   const calls: string[] = []
-  const t3 = new T3({} as never) as unknown as { call: (name: string, args: Record<string, unknown>) => Promise<unknown> } & T3
-  t3.call = async (name, args) => {
+  const t3 = new T3({} as never)
+  const call = async (name: string, args: Record<string, unknown>): Promise<unknown> => {
     calls.push(name)
     const tool = tools[name]
     if (!tool) throw new Error(`MCP error -32602: Tool '${name}' not found`)
     return tool(args)
   }
+  Object.assign(t3, { call })
   return { t3, calls }
 }
 
